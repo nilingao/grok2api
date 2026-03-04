@@ -84,6 +84,16 @@ async def _with_idle_timeout(
         idle_timeout: 空闲超时时间(秒)，0 表示禁用
         model: 模型名称(用于日志)
     """
+    try:
+        idle_timeout = float(idle_timeout or 0)
+    except (ValueError, TypeError):
+        idle_timeout = 0.0
+
+    try:
+        first_item_timeout = float(first_item_timeout or 0) if first_item_timeout is not None else 0.0
+    except (ValueError, TypeError):
+        first_item_timeout = 0.0
+
     if idle_timeout <= 0:
         async for item in iterable:
             yield item

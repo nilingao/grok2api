@@ -843,7 +843,7 @@
       },
       body: JSON.stringify({
         prompt,
-        image_url: imageUrl || null,
+        image_url: parentPostId ? null : (imageUrl || null),
         parent_post_id: parentPostId || null,
         source_image_url: parentPostId ? (resolvedRef.sourceUrl || imageUrl || null) : null,
         reasoning_effort: DEFAULT_REASONING_EFFORT,
