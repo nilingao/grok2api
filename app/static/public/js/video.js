@@ -1681,7 +1681,7 @@
     startElapsedTimer();
     try {
       const nextRound = editingRound + 1;
-      const basePreset = presetSelect ? presetSelect.value : 'normal';
+      const concurrent = getConcurrentValue();
 
       const body = {
         prompt: prompt,
@@ -1690,7 +1690,7 @@
         resolution_name: resolutionSelect ? resolutionSelect.value : '480p',
         preset: (!prompt || prompt.trim() === '') ? 'spicy' : (presetSelect ? presetSelect.value : 'normal'),
         reasoning_effort: typeof DEFAULT_REASONING_EFFORT !== 'undefined' ? DEFAULT_REASONING_EFFORT : null,
-        concurrent: 1,
+        concurrent,
         is_video_extension: true,
         extend_post_id: currentExtendPostId,
         video_extension_start_time: extensionStartTime,

@@ -283,16 +283,14 @@ async def public_video_start(data: VideoStartRequest):
                 status_code=400,
                 detail="video_extension_start_time must be a non-negative number",
             )
-        
-        # 官方服务端对延长视频容易触发风控，在此强制固定并发为1
-        concurrent = 1
 
         logger.info(
             "Public video extension request: "
             f"extend_post_id={extend_post_id}, "
             f"start_time={video_extension_start_time}, "
             f"original_post_id={original_post_id}, "
-            f"file_attachment_id={file_attachment_id}"
+            f"file_attachment_id={file_attachment_id}, "
+            f"concurrent={concurrent}"
         )
     else:
         if parent_post_id and image_url:
