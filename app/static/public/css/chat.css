@@ -888,8 +888,12 @@ html[data-theme='dark'] .think-block[data-thinking="true"] .think-agent summary 
   background: var(--chat-surface);
   box-shadow: 0 16px 34px rgba(17, 17, 17, 0.18);
   padding: 6px;
-  z-index: 40;
-}
+  z-index: 90;
+  }
+
+  .chat-sidebar .sidebar-header {
+    padding-top: calc(12px + env(safe-area-inset-top, 0px));
+  }
 
 .model-option {
   width: 100%;
@@ -1217,13 +1221,17 @@ html[data-theme='dark'] .model-option.active {
   flex-shrink: 0;
   border: none;
   border-radius: 16px;
-  background: transparent;
+  background: var(--chat-surface);
   display: flex;
   flex-direction: column;
   overflow: hidden;
   height: calc(100vh - 56px - 64px);
   position: sticky;
   top: 56px;
+}
+
+html[data-theme='dark'] .chat-sidebar {
+  background: #0d1520;
 }
 
 .sidebar-header {
@@ -1429,16 +1437,22 @@ html[data-theme='dark'] .model-option.active {
 
   .chat-sidebar {
     position: fixed;
-    top: 56px;
+    top: 0;
     left: 0;
-    height: calc(100% - 56px);
+    height: 100%;
     transform: translateX(-110%);
     transition: transform 0.2s ease;
-    z-index: 50;
+    z-index: 100; /* 高于 navbar */
+    border-radius: 0;
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.12);
   }
 
   .chat-sidebar.open {
     transform: translateX(0);
+  }
+
+  html[data-theme='dark'] .chat-sidebar {
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.45);
   }
 
   .sidebar-overlay {
@@ -1449,7 +1463,11 @@ html[data-theme='dark'] .model-option.active {
     opacity: 0;
     pointer-events: none;
     transition: opacity 0.2s ease;
-    z-index: 40;
+    z-index: 90;
+  }
+
+  .chat-sidebar .sidebar-header {
+    padding-top: calc(12px + env(safe-area-inset-top, 0px));
   }
 
   .sidebar-overlay.open {
