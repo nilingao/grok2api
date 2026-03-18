@@ -40,6 +40,18 @@ class AppChatReverse:
     """/rest/app-chat/conversations/new reverse interface."""
 
     @staticmethod
+    def _resolve_custom_personality() -> Optional[str]:
+        """Resolve optional custom personality from app config."""
+        value = get_config("app.custom_instruction", "")
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            value = str(value)
+        if not value.strip():
+            return None
+        return value
+
+    @staticmethod
     def build_payload(
         message: str,
         model: str,
@@ -93,6 +105,13 @@ class AppChatReverse:
 
         if model_config_override:
             payload["responseMetadata"]["modelConfigOverride"] = model_config_override
+
+        if model == "grok-420":
+            payload["enable420"] = True
+
+        custom_personality = AppChatReverse._resolve_custom_personality()
+        if custom_personality is not None and "Greet the user" not in message[-1000:]:
+            payload["customPersonality"] = custom_personality
 
         return payload
 

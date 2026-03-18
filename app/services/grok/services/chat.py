@@ -1,4 +1,4 @@
-﻿"""
+"""
 Grok Chat 服务
 """
 
@@ -130,7 +130,14 @@ class MessageExtractor:
 
             if isinstance(content, str):
                 if content.strip():
-                    parts.append(content)
+                    text_to_add = content
+                    if role == "tool" and len(text_to_add) > 3000:
+                        text_to_add = (
+                            text_to_add[:1500] 
+                            + "\n\n... [Output Truncated for Conciseness] ...\n\n" 
+                            + text_to_add[-1000:]
+                        )
+                    parts.append(text_to_add)
             elif isinstance(content, dict):
                 content = [content]
                 for item in content:
@@ -209,11 +216,11 @@ class MessageExtractor:
                 role_label = role
                 if role == "tool":
                     name = msg.get("name")
-                    call_id = msg.get("tool_call_id")
                     if isinstance(name, str) and name.strip():
-                        role_label = f"tool[{name.strip()}]"
-                    if isinstance(call_id, str) and call_id.strip():
-                        role_label = f"{role_label}#{call_id.strip()}"
+                        role_label = f"--- Action Result: {name.strip()} ---"
+                        full_text = "\n".join(parts)
+                        if "exited with code" in full_text and "code 0" not in full_text:
+                            role_label += " [FAILED]"
                 extracted.append({"role": role_label, "text": "\n".join(parts)})
 
         # 找到最后一条 user 消息
@@ -239,7 +246,26 @@ class MessageExtractor:
         if tools:
             tool_prompt = build_tool_prompt(tools, tool_choice, parallel_tool_calls)
             if tool_prompt:
-                combined = f"{tool_prompt}\n\n{combined}"
+                # 注入 Few-Shot 引导以避免模型惯性，强化 Tool Calling 回语。
+                few_shot = (
+                    "\n\n--- CRITICAL: TOOL CALL REQUIREMENT ---\n"
+                    "Example:\n"
+                    "User: test.txt 里面有什么内容？\n"
+                    "Assistant: <tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"test.txt\"}}</tool_call>\n"
+                    "User: 【System Notification: Tool Execution Result - read】\nhello world\n"
+                    "Assistant: test.txt 的内容是 hello world。\n"
+                    "--- END EXAMPLE ---\n\n"
+                    "Important Guidelines:\n"
+                    "1. **Task Complete**: If the information you have (including tool execution results) is SUFFICIENT to answer the user, you MUST answer directly in human language. DO NOT call any tools.\n"
+                    "2. **More Tools Needed**: If it is INDISPENSABLE to use a tool, you MUST output ONLY the raw `<tool_call>` block without conversational narrative filler."
+                )
+                combined = f"{tool_prompt}{few_shot}\n\n{combined}"
+                # 尾插强化 (Tail Enforcement)
+                combined += (
+                    "\n\n--- Important Note ---\n"
+                    "- Only respond using the valid structural `<tool_call>` JSON tag if you need data from available tools.\n"
+                    "- Provide only one single execution block and wait for response without dialogue."
+                )
 
         return combined, file_attachments, image_attachments
 
