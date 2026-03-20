@@ -398,6 +398,65 @@
     return `data:${mime};base64,${compact}`;
   }
 
+  function shouldUsePublicImageFallback(value) {
+    const raw = String(value || '').trim().toLowerCase();
+    if (!raw) return false;
+    if (raw.startsWith('data:')) return false;
+    if (raw.startsWith('/v1/files/image/') || raw.includes('/v1/files/image/')) return false;
+    if (raw.includes('imagine-public.x.ai/imagine-public/images/')) return false;
+    if (raw.includes('imagine-public.x.ai/imagine-public/share-images/')) return false;
+    if (raw.includes('assets.grok.com')) return true;
+    if (raw.startsWith('/users/') || raw.includes('/users/')) return true;
+    return false;
+  }
+
+  function resolveCandidateImageUrl(raw, parentPostId) {
+    const normalized = toDataUrl(raw);
+    if (!normalized) return '';
+    if (parentPostId && shouldUsePublicImageFallback(normalized)) {
+      return buildImaginePublicUrl(parentPostId);
+    }
+    return normalized;
+  }
+
+  function normalizeCandidatePayload(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    const firstDataItem = Array.isArray(payload.data)
+      ? payload.data.find((item) => item && typeof item === 'object')
+      : null;
+    const imageValue = (
+      payload.b64_json
+      || payload.url
+      || payload.image
+      || payload.base64
+      || (firstDataItem && (
+        firstDataItem.b64_json
+        || firstDataItem.url
+        || firstDataItem.image
+        || firstDataItem.base64
+      ))
+      || ''
+    );
+    if (!imageValue) return null;
+
+    return {
+      ...payload,
+      b64_json: payload.b64_json || (firstDataItem && firstDataItem.b64_json) || '',
+      url: payload.url || (firstDataItem && firstDataItem.url) || '',
+      image: payload.image || (firstDataItem && firstDataItem.image) || '',
+      base64: payload.base64 || (firstDataItem && firstDataItem.base64) || '',
+      image_id: payload.image_id || (firstDataItem && firstDataItem.image_id) || '',
+      imageId: payload.imageId || (firstDataItem && firstDataItem.imageId) || '',
+      parent_post_id: payload.parent_post_id || (firstDataItem && firstDataItem.parent_post_id) || '',
+      current_parent_post_id: payload.current_parent_post_id || (firstDataItem && firstDataItem.current_parent_post_id) || '',
+      generated_parent_post_id: payload.generated_parent_post_id || (firstDataItem && firstDataItem.generated_parent_post_id) || '',
+      current_source_image_url: payload.current_source_image_url || (firstDataItem && firstDataItem.current_source_image_url) || '',
+      source_image_url: payload.source_image_url || (firstDataItem && firstDataItem.source_image_url) || '',
+      thumbnailImageUrl: payload.thumbnailImageUrl || (firstDataItem && firstDataItem.thumbnailImageUrl) || '',
+      _raw_image: String(imageValue || '').trim(),
+    };
+  }
+
   function normalizeAuthHeader(authHeader) {
     if (!authHeader) return '';
     if (authHeader.startsWith('Bearer ')) {
@@ -1180,6 +1239,15 @@
       img.alt = `candidate-${item.index}`;
       img.loading = 'lazy';
       img.decoding = 'async';
+      img.addEventListener('error', () => {
+        if (!item.parentPostId) return;
+        if (img.dataset.fallbackApplied === '1') return;
+        const fallback = buildImaginePublicUrl(item.parentPostId);
+        if (!fallback || img.src === fallback) return;
+        img.dataset.fallbackApplied = '1';
+        img.src = fallback;
+        item.imageUrl = fallback;
+      });
 
       const badge = document.createElement('div');
       badge.className = 'selected-badge';
@@ -1221,15 +1289,16 @@
   }
 
   function addCandidate(payload) {
-    const raw = payload.b64_json || payload.url || payload.image || '';
+    const raw = payload._raw_image || payload.b64_json || payload.url || payload.image || payload.base64 || '';
     if (!raw) return;
 
     const parentPostId = extractParentPostId(payload);
+    const imageIdHint = String(payload.image_id || payload.imageId || '').trim();
 
-    const id = parentPostId || `local-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const id = parentPostId || imageIdHint || `local-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     if (state.candidates.some((item) => item.id === id)) return;
 
-    const imageUrl = toDataUrl(raw);
+    const imageUrl = resolveCandidateImageUrl(raw, parentPostId);
     if (!imageUrl) return;
 
     const sourceImageUrl = pickSourceImageUrl(
@@ -1270,9 +1339,13 @@
   }
 
   function extractCandidatePayload(payload) {
-    if (!payload || typeof payload !== 'object') return null;
-    if (payload.type === 'image_generation.completed') return payload;
-    if (payload.type === 'image') return payload;
+    const normalized = normalizeCandidatePayload(payload);
+    if (!normalized) return null;
+    const type = String(payload && payload.type ? payload.type : '').trim();
+    if (!type) return normalized;
+    if (type === 'image_generation.completed') return normalized;
+    if (type === 'image') return normalized;
+    if (type === 'response.output_image') return normalized;
     return null;
   }
 
