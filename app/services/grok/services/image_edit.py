@@ -231,6 +231,8 @@ def _should_skip_parent_precreate(image_ref: str) -> bool:
     raw = str(image_ref or "").strip().lower()
     if "imagine-public.x.ai/imagine-public/share-images/" in raw:
         return True
+    if "imagine-public.x.ai/imagine-public/images/" in raw:
+        return True
     return False
 
 
@@ -1483,16 +1485,48 @@ class ImageCollectProcessor(BaseProcessor):
             logger.debug("Image collect cancelled by client")
         except StreamIdleTimeoutError as e:
             logger.warning(f"Image collect idle timeout: {e}")
+            if not images:
+                raise UpstreamException(
+                    message=f"Image collect stream idle timeout after {e.idle_seconds}s",
+                    status_code=504,
+                    details={
+                        "status": 504,
+                        "error": str(e),
+                        "error_code": "stream_idle_timeout",
+                        "idle_seconds": e.idle_seconds,
+                    },
+                )
         except RequestsError as e:
             if _is_http2_error(e):
                 logger.warning(f"HTTP/2 stream error in image collect: {e}")
+                if not images:
+                    raise UpstreamException(
+                        message="Image collect upstream connection closed unexpectedly",
+                        status_code=502,
+                        details={
+                            "status": 502,
+                            "error": str(e),
+                            "error_code": "http2_stream_error",
+                        },
+                    )
             else:
                 logger.error(f"Image collect request error: {e}")
+                if not images:
+                    raise UpstreamException(
+                        message=f"Image collect upstream request failed: {e}",
+                        status_code=502,
+                        details={
+                            "status": 502,
+                            "error": str(e),
+                        },
+                    )
         except Exception as e:
             logger.error(
                 f"Image collect processing error: {e}",
                 extra={"error_type": type(e).__name__},
             )
+            if not images:
+                raise
         finally:
             await self.close()
 
