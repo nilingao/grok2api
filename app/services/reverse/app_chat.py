@@ -60,10 +60,18 @@ class AppChatReverse:
         tool_overrides: Dict[str, Any] = None,
         model_config_override: Dict[str, Any] = None,
         image_generation_count: int | None = None,
+        request_overrides: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Build chat payload for Grok app-chat API."""
 
         attachments = file_attachments or []
+        resolved_request_overrides = dict(request_overrides or {})
+        # Backward compatibility: legacy explicit arg still works.
+        if (
+            image_generation_count is not None
+            and "imageGenerationCount" not in resolved_request_overrides
+        ):
+            resolved_request_overrides["imageGenerationCount"] = image_generation_count
 
         payload = {
             "deviceEnvInfo": {
@@ -85,9 +93,7 @@ class AppChatReverse:
             "forceConcise": False,
             "forceSideBySide": False,
             "imageAttachments": [],
-            "imageGenerationCount": image_generation_count
-            if image_generation_count is not None
-            else 2,
+            "imageGenerationCount": 2,
             "isAsyncChat": False,
             "isReasoning": False,
             "message": message,
@@ -116,6 +122,12 @@ class AppChatReverse:
         if custom_personality is not None and "Greet the user" not in message[-1000:]:
             payload["customPersonality"] = custom_personality
 
+        if resolved_request_overrides:
+            for key, value in resolved_request_overrides.items():
+                if value is None:
+                    continue
+                payload[key] = value
+
         return payload
 
     @staticmethod
@@ -130,6 +142,7 @@ class AppChatReverse:
         tool_overrides: Dict[str, Any] = None,
         model_config_override: Dict[str, Any] = None,
         image_generation_count: int | None = None,
+        request_overrides: Dict[str, Any] | None = None,
     ) -> Any:
         """Send app chat request to Grok.
         
@@ -142,6 +155,7 @@ class AppChatReverse:
             file_attachments: List[str], the file attachments to send.
             tool_overrides: Dict[str, Any], the tool overrides to use.
             model_config_override: Dict[str, Any], the model config override to use.
+            request_overrides: Dict[str, Any], request top-level field overrides.
 
         Returns:
             Any: The response from the request.
@@ -168,6 +182,7 @@ class AppChatReverse:
                 tool_overrides=tool_overrides,
                 model_config_override=model_config_override,
                 image_generation_count=image_generation_count,
+                request_overrides=request_overrides,
             )
             logger.info(
                 "AppChat request prepared: "
@@ -176,7 +191,8 @@ class AppChatReverse:
                 f"mode={mode or '-'}, "
                 f"message_len={len(message or '')}, "
                 f"file_attachments={len(file_attachments or [])}, "
-                f"tools={','.join((tool_overrides or {}).keys()) or '-'}"
+                f"tools={','.join((tool_overrides or {}).keys()) or '-'}, "
+                f"request_override_keys={','.join(sorted((request_overrides or {}).keys())) or '-'}"
             )
 
             # Curl Config

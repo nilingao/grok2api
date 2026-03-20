@@ -1140,6 +1140,16 @@ class ImageStreamProcessor(BaseProcessor):
         """Build SSE response."""
         return f"event: {event}\ndata: {orjson.dumps(data).decode()}\n\n"
 
+    @staticmethod
+    def _extract_stream_image_id(url: str, index: int) -> str:
+        image_id = _extract_image_post_id(url)
+        if image_id:
+            return image_id
+        match = re.search(r"/images/([0-9a-zA-Z-]{16,64})(?:\.[a-z]+|/|$)", str(url or ""))
+        if match:
+            return str(match.group(1) or "").strip()
+        return f"image-{index}-{random.randint(1000, 9999)}"
+
     async def process(
         self, response: AsyncIterable[bytes]
     ) -> AsyncGenerator[str, None]:
@@ -1183,7 +1193,8 @@ class ImageStreamProcessor(BaseProcessor):
                 # modelResponse
                 if mr := resp.get("modelResponse"):
                     if urls := _collect_images(mr):
-                        for url in urls:
+                        for url_index, url in enumerate(urls):
+                            image_id = self._extract_stream_image_id(url, url_index)
                             if self.response_format == "url":
                                 try:
                                     processed = await self.process_url(url, "image")
@@ -1194,7 +1205,9 @@ class ImageStreamProcessor(BaseProcessor):
                                     )
                                     processed = _normalize_fallback_image_url(url)
                                 if processed:
-                                    final_images.append(processed)
+                                    final_images.append(
+                                        {"image_id": image_id, "image_data": processed}
+                                    )
                                 continue
                             try:
                                 dl_service = self._get_dl()
@@ -1206,23 +1219,31 @@ class ImageStreamProcessor(BaseProcessor):
                                         b64 = base64_data.split(",", 1)[1]
                                     else:
                                         b64 = base64_data
-                                    final_images.append(b64)
+                                    final_images.append(
+                                        {"image_id": image_id, "image_data": b64}
+                                    )
                             except Exception as e:
                                 logger.warning(
                                     f"Failed to convert image to base64, falling back to URL: {e}"
                                 )
                                 processed = await self.process_url(url, "image")
                                 if processed:
-                                    final_images.append(processed)
+                                    final_images.append(
+                                        {"image_id": image_id, "image_data": processed}
+                                    )
                     continue
 
-            for index, b64 in enumerate(final_images):
+            for index, item in enumerate(final_images):
                 if self.n == 1:
                     if index != self.target_index:
                         continue
                     out_index = 0
                 else:
                     out_index = index
+                image_id = str(item.get("image_id") or "").strip() or (
+                    f"image-{out_index}-{random.randint(1000, 9999)}"
+                )
+                b64 = item.get("image_data", "")
 
                 yield self._sse(
                     "image_generation.completed",
@@ -1230,6 +1251,8 @@ class ImageStreamProcessor(BaseProcessor):
                         "type": "image_generation.completed",
                         self.response_field: b64,
                         "index": out_index,
+                        "image_id": image_id,
+                        "stage": "final",
                         "usage": {
                             "total_tokens": 0,
                             "input_tokens": 0,
@@ -1241,9 +1264,8 @@ class ImageStreamProcessor(BaseProcessor):
                         },
                     },
                 )
-                post_id = _extract_image_post_id(b64)
-                if post_id and self.token:
-                    await _try_log_image_share_link(self.token, post_id, local_url=b64)
+                if image_id and self.token:
+                    await _try_log_image_share_link(self.token, image_id, local_url=b64)
         except asyncio.CancelledError:
             logger.debug("Image stream cancelled by client")
         except StreamIdleTimeoutError as e:

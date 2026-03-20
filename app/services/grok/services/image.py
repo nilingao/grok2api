@@ -18,6 +18,11 @@ from app.core.config import get_config
 from app.core.logger import logger
 from app.core.storage import DATA_DIR
 from app.core.exceptions import AppException, ErrorType, UpstreamException
+from app.services.grok.services.chat import GrokChatService
+from app.services.grok.services.image_edit import (
+    ImageCollectProcessor as AppChatImageCollectProcessor,
+    ImageStreamProcessor as AppChatImageStreamProcessor,
+)
 from app.services.grok.utils.process import BaseProcessor
 from app.services.grok.utils.retry import pick_token, rate_limited
 from app.services.grok.utils.stream import wrap_stream_with_usage
@@ -134,6 +139,31 @@ class ImageGenerationService:
                     tried_tokens.add(current_token)
                     yielded = False
                     try:
+                        result = await self._stream_app_chat(
+                            token_mgr=token_mgr,
+                            token=current_token,
+                            model_info=model_info,
+                            prompt=prompt,
+                            n=n,
+                            response_format=response_format,
+                            size=size,
+                            aspect_ratio=aspect_ratio,
+                            enable_nsfw=enable_nsfw,
+                        )
+                        async for chunk in result.data:
+                            yielded = True
+                            yield chunk
+                        return
+                    except Exception as app_chat_error:
+                        if yielded:
+                            raise
+                        logger.warning(
+                            "App-chat image stream failed, fallback to ws_imagine: %s",
+                            app_chat_error,
+                        )
+
+                    yielded = False
+                    try:
                         result = await self._stream_ws(
                             token_mgr=token_mgr,
                             token=current_token,
@@ -190,6 +220,26 @@ class ImageGenerationService:
 
             tried_tokens.add(current_token)
             try:
+                result = await self._collect_app_chat(
+                    token=current_token,
+                    model_info=model_info,
+                    prompt=prompt,
+                    n=n,
+                    response_format=response_format,
+                    aspect_ratio=aspect_ratio,
+                    enable_nsfw=enable_nsfw,
+                )
+                try:
+                    await token_mgr.consume(current_token, self._get_effort(model_info))
+                except Exception as consume_error:
+                    logger.warning(f"Failed to consume token: {consume_error}")
+                return result
+            except Exception as app_chat_error:
+                logger.warning(
+                    "App-chat image collect failed, fallback to ws_imagine: %s",
+                    app_chat_error,
+                )
+            try:
                 return await self._collect_ws(
                     token_mgr=token_mgr,
                     token=current_token,
@@ -218,6 +268,112 @@ class ImageGenerationService:
             error_type=ErrorType.RATE_LIMIT.value,
             code="rate_limit_exceeded",
             status_code=429,
+        )
+
+    @staticmethod
+    def _build_app_chat_request_overrides(
+        *, n: int, enable_nsfw: bool
+    ) -> Dict[str, Any]:
+        return {
+            "imageGenerationCount": max(1, min(int(n), 10)),
+            "enableNsfw": bool(enable_nsfw),
+        }
+
+    async def _stream_app_chat(
+        self,
+        *,
+        token_mgr: Any,
+        token: str,
+        model_info: Any,
+        prompt: str,
+        n: int,
+        response_format: str,
+        size: str,
+        aspect_ratio: str,
+        enable_nsfw: Optional[bool] = None,
+    ) -> ImageGenerationResult:
+        if enable_nsfw is None:
+            enable_nsfw = bool(get_config("image.nsfw"))
+        _ = size, aspect_ratio
+        stream_response = await GrokChatService().chat(
+            token=token,
+            message=prompt,
+            model=model_info.grok_model,
+            requested_model=model_info.model_id,
+            mode=model_info.model_mode,
+            stream=True,
+            tool_overrides={"imageGen": True},
+            request_overrides=self._build_app_chat_request_overrides(
+                n=n,
+                enable_nsfw=enable_nsfw,
+            ),
+        )
+        processor = AppChatImageStreamProcessor(
+            model_info.model_id,
+            token,
+            n=n,
+            response_format=response_format,
+        )
+        stream_data = wrap_stream_with_usage(
+            processor.process(stream_response),
+            token_mgr,
+            token,
+            model_info.model_id,
+        )
+        return ImageGenerationResult(stream=True, data=stream_data)
+
+    async def _collect_app_chat(
+        self,
+        *,
+        token: str,
+        model_info: Any,
+        prompt: str,
+        n: int,
+        response_format: str,
+        aspect_ratio: str,
+        enable_nsfw: Optional[bool] = None,
+    ) -> ImageGenerationResult:
+        if enable_nsfw is None:
+            enable_nsfw = bool(get_config("image.nsfw"))
+        _ = aspect_ratio
+        stream_response = await GrokChatService().chat(
+            token=token,
+            message=prompt,
+            model=model_info.grok_model,
+            requested_model=model_info.model_id,
+            mode=model_info.model_mode,
+            stream=True,
+            tool_overrides={"imageGen": True},
+            request_overrides=self._build_app_chat_request_overrides(
+                n=n,
+                enable_nsfw=enable_nsfw,
+            ),
+        )
+        processor = AppChatImageCollectProcessor(
+            model_info.model_id,
+            token,
+            response_format=response_format,
+        )
+        all_images = await processor.process(stream_response)
+        if len(all_images) < n:
+            raise UpstreamException(
+                "App-chat image generation returned insufficient results",
+                details={
+                    "error_code": "app_chat_insufficient_images",
+                    "final_images": len(all_images),
+                    "requested": n,
+                },
+            )
+
+        selected = self._select_images(all_images, n)
+        usage_override = {
+            "total_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
+        }
+        return ImageGenerationResult(
+            stream=False, data=selected, usage_override=usage_override
         )
 
     async def _stream_ws(
