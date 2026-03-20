@@ -15,6 +15,23 @@ from app.services.token.manager import get_token_manager
 router = APIRouter()
 
 
+_TOKEN_CHAR_REPLACEMENTS = str.maketrans(
+    {
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2212": "-",
+        "\u00a0": " ",
+        "\u2007": " ",
+        "\u202f": " ",
+        "\u200b": "",
+        "\u200c": "",
+        "\u200d": "",
+        "\ufeff": "",
+    }
+)
 def _mask_token_for_log(token: str) -> str:
     raw = str(token or "").strip()
     if not raw:
@@ -23,6 +40,13 @@ def _mask_token_for_log(token: str) -> str:
         return raw
     return f"{raw[:6]}...{raw[-6:]}"
 
+def _sanitize_token_text(value) -> str:
+    token = "" if value is None else str(value)
+    token = token.translate(_TOKEN_CHAR_REPLACEMENTS)
+    token = re.sub(r"\s+", "", token)
+    if token.startswith("sso="):
+        token = token[4:]
+    return token.encode("ascii", errors="ignore").decode("ascii")
 
 def _log_nsfw_enable_payload(api_name: str, data: dict) -> None:
     single = str(data.get("token") or "").strip()
@@ -37,6 +61,26 @@ def _log_nsfw_enable_payload(api_name: str, data: dict) -> None:
         "raw_keys": sorted(list(data.keys())) if isinstance(data, dict) else [],
     }
     logger.info(f"{api_name} request payload: {payload}")
+
+
+def _normalize_token_item(item, allowed_fields: set[str]) -> dict | None:
+    if isinstance(item, str):
+        token_data = {"token": item}
+    elif isinstance(item, dict):
+        token_data = dict(item)
+    else:
+        return None
+
+    raw_token = token_data.get("token")
+    if raw_token is not None:
+        token_data["token"] = _sanitize_token_text(raw_token)
+    if not token_data.get("token"):
+        return None
+
+    if token_data.get("tags") is None:
+        token_data["tags"] = []
+
+    return {k: v for k, v in token_data.items() if k in allowed_fields}
 
 
 @router.get("/tokens", dependencies=[Depends(verify_app_key)])
@@ -114,6 +158,100 @@ async def update_tokens(data: dict):
             mgr = await get_token_manager()
             await mgr.reload()
         return {"status": "success", "message": "Token 已更新"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/tokens/append", dependencies=[Depends(verify_app_key)])
+async def append_tokens(data: dict):
+    """追加 Token 到现有池，不覆盖其他 pool 或现有 token。"""
+    storage = get_storage()
+    try:
+        from app.services.token.models import TokenInfo
+
+        async with storage.acquire_lock("tokens_save", timeout=10):
+            existing = await storage.load_tokens() or {}
+            allowed_fields = set(TokenInfo.model_fields.keys())
+
+            normalized_existing = {}
+            for pool_name, tokens in existing.items():
+                if not isinstance(tokens, list):
+                    continue
+                pool_map = {}
+                for item in tokens:
+                    filtered = _normalize_token_item(item, allowed_fields)
+                    if not filtered:
+                        continue
+                    token_key = filtered["token"]
+                    pool_map[token_key] = filtered
+                normalized_existing[pool_name] = pool_map
+
+            append_payload = data or {}
+
+            if isinstance(append_payload.get("pool"), str):
+                pool_name = append_payload.get("pool", "").strip()
+                tokens_value = append_payload.get("tokens")
+                single_token = append_payload.get("token")
+                token_items = []
+                if isinstance(tokens_value, list):
+                    token_items.extend(tokens_value)
+                if single_token is not None:
+                    token_items.append(single_token)
+                append_payload = {pool_name: token_items}
+
+            appended = 0
+            updated = 0
+
+            for pool_name, tokens in append_payload.items():
+                if not isinstance(pool_name, str) or not pool_name.strip():
+                    continue
+                if not isinstance(tokens, list):
+                    continue
+
+                pool_key = pool_name.strip()
+                pool_map = normalized_existing.setdefault(pool_key, {})
+
+                for item in tokens:
+                    filtered = _normalize_token_item(item, allowed_fields)
+                    if not filtered:
+                        logger.warning(f"Skip empty token in pool '{pool_key}'")
+                        continue
+
+                    token_key = filtered["token"]
+                    if token_key in pool_map:
+                        merged = dict(pool_map[token_key])
+                        merged.update(filtered)
+                        pool_map[token_key] = merged
+                        updated += 1
+                    else:
+                        pool_map[token_key] = filtered
+                        appended += 1
+
+            normalized = {}
+            for pool_name, pool_map in normalized_existing.items():
+                pool_list = []
+                for token_data in pool_map.values():
+                    try:
+                        info = TokenInfo(**token_data)
+                        pool_list.append(info.model_dump())
+                    except Exception as e:
+                        logger.warning(f"Skip invalid token in pool '{pool_name}': {e}")
+                        continue
+                normalized[pool_name] = pool_list
+
+            await storage.save_tokens(normalized)
+            mgr = await get_token_manager()
+            await mgr.reload()
+
+        return {
+            "status": "success",
+            "message": "Token 已追加",
+            "summary": {
+                "appended": appended,
+                "updated": updated,
+                "pools": len([k for k, v in append_payload.items() if isinstance(k, str)]),
+            },
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
