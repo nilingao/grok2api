@@ -1141,6 +1141,10 @@
     if (!sections.length) {
       return renderBasicMarkdown(text);
     }
+    const renderThinkAgentSummary = (title) => {
+      const safeTitle = escapeHtml(title);
+      return `<summary><span class="think-agent-avatar" aria-hidden="true"></span><span class="think-agent-label">${safeTitle}</span></summary>`;
+    };
     const renderGroups = (blocks, openAllGroups) => {
       const groups = [];
       const map = new Map();
@@ -1175,9 +1179,8 @@
         if (synthetic.length) {
           return synthetic.map((agent, agentIdx) => {
             const inner = renderFlatBlocks(agent.blocks);
-            const title = escapeHtml(agent.title);
             const openAttr = openAll ? ' open' : (idx === 0 && agentIdx === 0 ? ' open' : '');
-            return `<details class="think-agent"${openAttr}><summary>${title}</summary><div class="think-agent-items">${inner}</div></details>`;
+            return `<details class="think-agent"${openAttr}>${renderThinkAgentSummary(agent.title)}<div class="think-agent-items">${inner}</div></details>`;
           }).join('');
         }
       }
@@ -1187,9 +1190,8 @@
       if (!section.title) {
         return `<div class="think-agent-items">${inner}</div>`;
       }
-      const title = escapeHtml(section.title);
       const openAttr = openAll ? ' open' : (idx === 0 ? ' open' : '');
-      return `<details class="think-agent"${openAttr}><summary>${title}</summary><div class="think-agent-items">${inner}</div></details>`;
+      return `<details class="think-agent"${openAttr}>${renderThinkAgentSummary(section.title)}<div class="think-agent-items">${inner}</div></details>`;
     });
     return `<div class="think-agents">${agentBlocks.join('')}</div>`;
   }
@@ -1617,14 +1619,14 @@
       if (!entry.thinkingActive) {
         block.removeAttribute('data-thinking');
         node.style.removeProperty('--think-spin-delay');
-        block.querySelectorAll('.think-agent summary').forEach((summary) => {
-          summary.style.removeProperty('--think-spin-delay');
+        block.querySelectorAll('.think-agent-avatar').forEach((avatar) => {
+          avatar.style.removeProperty('--think-spin-delay');
         });
       } else {
         block.setAttribute('data-thinking', 'true');
         node.style.setProperty('--think-spin-delay', spinOffset);
-        block.querySelectorAll('.think-agent summary').forEach((summary) => {
-          summary.style.setProperty('--think-spin-delay', spinOffset);
+        block.querySelectorAll('.think-agent-avatar').forEach((avatar) => {
+          avatar.style.setProperty('--think-spin-delay', spinOffset);
         });
       }
     });
