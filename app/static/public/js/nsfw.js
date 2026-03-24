@@ -26,6 +26,7 @@
   const candidateWaterfall = document.getElementById('candidateWaterfall');
   const videoEmpty = document.getElementById('videoEmpty');
   const videoResults = document.getElementById('videoResults');
+  const nsfwVideoReverseBtn = document.getElementById('nsfwVideoReverseBtn');
   const lightbox = document.getElementById('lightbox');
   const lightboxImg = document.getElementById('lightboxImg');
   const closeLightbox = document.getElementById('closeLightbox');
@@ -54,6 +55,8 @@
     videoJobs: new Map(),
     videoTaskIds: [],
     videoRunning: false,
+    videoResultsReversed: false,
+    videoOrderSeed: 0,
     videoAuthHeader: '',
     videoRawPublicKey: '',
     lightboxIndex: -1,
@@ -339,6 +342,22 @@
     if (videoCount) {
       videoCount.textContent = `${state.videoTaskIds.length} 个任务`;
     }
+    if (nsfwVideoReverseBtn) {
+      nsfwVideoReverseBtn.textContent = state.videoResultsReversed ? '正序显示' : '倒序显示';
+      nsfwVideoReverseBtn.setAttribute('aria-pressed', state.videoResultsReversed ? 'true' : 'false');
+    }
+  }
+
+  function syncVideoResultsOrder() {
+    if (!videoResults) return;
+    const items = Array.from(videoResults.querySelectorAll('.video-item'));
+    if (!items.length) return;
+    items.sort((a, b) => {
+      const aOrder = Number(a.dataset.order || '0');
+      const bOrder = Number(b.dataset.order || '0');
+      return state.videoResultsReversed ? (bOrder - aOrder) : (aOrder - bOrder);
+    });
+    items.forEach((item) => videoResults.appendChild(item));
   }
 
   function setToggleButtonState(button, running, runningText) {
@@ -1447,6 +1466,7 @@
     item.className = 'video-item';
     item.dataset.taskId = taskId;
     item.dataset.defaultTitle = `任务 ${index}`;
+    item.dataset.order = String(++state.videoOrderSeed);
     item.innerHTML = `
       <div class="video-item-head">
         <div class="video-item-title">任务 ${index}</div>
@@ -1460,6 +1480,7 @@
         </div>
       `;
     videoResults.appendChild(item);
+    syncVideoResultsOrder();
     applyNsfwVideoCardTitle(item, `任务 ${index}`);
     return item;
   }
@@ -1806,6 +1827,7 @@
     }
     state.videoJobs.clear();
     state.videoTaskIds = [];
+    state.videoOrderSeed = 0;
     if (videoResults) {
       videoResults.innerHTML = '';
     }
@@ -1898,6 +1920,14 @@
       } catch (e) {
         toast('下载失败，请检查链接可访问性', 'error');
       }
+    });
+  }
+
+  if (nsfwVideoReverseBtn) {
+    nsfwVideoReverseBtn.addEventListener('click', () => {
+      state.videoResultsReversed = !state.videoResultsReversed;
+      syncVideoResultsOrder();
+      updateCounters();
     });
   }
 
