@@ -54,3 +54,95 @@ class MediaPost404HandlingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {})
+
+    async def test_capture_metadata_creates_post_when_probe_not_found(self):
+        calls = {"get": [], "request": [], "create_link": []}
+
+        async def _fake_get(_session, _token, post_id):
+            calls["get"].append(post_id)
+            return _FakeResponse(200, "{}")
+
+        async def _fake_request(_session, _token, media_type, media_url, prompt=""):
+            calls["request"].append((media_type, media_url, prompt))
+            return _FakeResponse(
+                200,
+                '{"post":{"id":"new-post-id","mediaUrl":"https://assets.grok.com/users/u1/generated/p1/image.jpg","mediaType":"MEDIA_POST_TYPE_IMAGE"}}',
+            )
+
+        async def _fake_create_link(_session, _token, post_id, source="post-page", platform="web"):
+            calls["create_link"].append((post_id, source, platform))
+            return _FakeResponse(200, '{"shareLink":"https://grok.com/imagine/post/new-post-id"}')
+
+        with patch(
+            "app.services.reverse.media_post.MediaPostReverse.get",
+            new=_fake_get,
+        ), patch(
+            "app.services.reverse.media_post.MediaPostReverse.request",
+            new=_fake_request,
+        ), patch(
+            "app.services.reverse.media_post.MediaPostReverse.create_link",
+            new=_fake_create_link,
+        ):
+            metadata = await MediaPostReverse.capture_metadata(
+                _FakeSession(),
+                "sso=test",
+                "old-non-post-id",
+                media_type="image",
+                local_url="https://assets.grok.com/users/u1/generated/p1/image.jpg",
+            )
+
+        self.assertEqual(metadata.get("post_id"), "new-post-id")
+        self.assertEqual(
+            metadata.get("share_link"),
+            "https://grok.com/imagine/post/new-post-id",
+        )
+        self.assertEqual(calls["get"], ["old-non-post-id"])
+        self.assertEqual(
+            calls["request"],
+            [("MEDIA_POST_TYPE_IMAGE", "https://assets.grok.com/users/u1/generated/p1/image.jpg", "")],
+        )
+        self.assertEqual(calls["create_link"], [("new-post-id", "post-page", "web")])
+
+    async def test_capture_metadata_prefers_create_for_generated_asset_ids(self):
+        calls = {"get": [], "request": [], "create_link": []}
+
+        async def _fake_get(_session, _token, post_id):
+            calls["get"].append(post_id)
+            return _FakeResponse(200, "{}")
+
+        async def _fake_request(_session, _token, media_type, media_url, prompt=""):
+            calls["request"].append((media_type, media_url, prompt))
+            return _FakeResponse(
+                200,
+                '{"post":{"id":"created-from-asset","mediaUrl":"https://assets.grok.com/users/u1/generated/abc123-def456-7890-abcd-ef1234567890/image.jpg","mediaType":"MEDIA_POST_TYPE_IMAGE"}}',
+            )
+
+        async def _fake_create_link(_session, _token, post_id, source="post-page", platform="web"):
+            calls["create_link"].append((post_id, source, platform))
+            return _FakeResponse(
+                200,
+                '{"shareLink":"https://grok.com/imagine/post/created-from-asset"}',
+            )
+
+        with patch(
+            "app.services.reverse.media_post.MediaPostReverse.get",
+            new=_fake_get,
+        ), patch(
+            "app.services.reverse.media_post.MediaPostReverse.request",
+            new=_fake_request,
+        ), patch(
+            "app.services.reverse.media_post.MediaPostReverse.create_link",
+            new=_fake_create_link,
+        ):
+            metadata = await MediaPostReverse.capture_metadata(
+                _FakeSession(),
+                "sso=test",
+                "abc123-def456-7890-abcd-ef1234567890",
+                media_type="image",
+                local_url="https://assets.grok.com/users/u1/generated/abc123-def456-7890-abcd-ef1234567890/image.jpg",
+            )
+
+        self.assertEqual(metadata.get("post_id"), "created-from-asset")
+        self.assertEqual(calls["get"], [])
+        self.assertEqual(len(calls["request"]), 1)
+        self.assertEqual(calls["create_link"], [("created-from-asset", "post-page", "web")])

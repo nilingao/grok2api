@@ -75,16 +75,85 @@ class MediaPostReverse:
         post_payload = {}
         share_payload = {}
         share_link = ""
+
+        def _payload_post(data: dict[str, Any]) -> dict[str, Any]:
+            post_obj = data.get("post", {}) if isinstance(data, dict) else {}
+            return post_obj if isinstance(post_obj, dict) else {}
+
+        def _extract_post_id(data: dict[str, Any]) -> str:
+            return str(_payload_post(data).get("id") or "").strip()
+
+        def _resolve_media_post_type(value: str) -> str:
+            raw = str(value or "").strip().upper()
+            if raw in {"MEDIA_POST_TYPE_IMAGE", "MEDIA_POST_TYPE_VIDEO"}:
+                return raw
+            if raw in {"IMAGE", "IMG"}:
+                return "MEDIA_POST_TYPE_IMAGE"
+            if raw in {"VIDEO", "VID"}:
+                return "MEDIA_POST_TYPE_VIDEO"
+            return "MEDIA_POST_TYPE_IMAGE"
+
+        source_url = str(local_url or "").strip()
+        source_url_lower = source_url.lower()
+        should_create_before_get = bool(
+            source_url
+            and (
+                f"/generated/{post_text.lower()}" in source_url_lower
+                or f"/users/" in source_url_lower and f"/{post_text.lower()}/content" in source_url_lower
+            )
+        )
+
+        async def _create_from_source_url() -> None:
+            nonlocal post_text, post_payload, post_obj
+            if not source_url or not (
+                source_url.startswith("http://") or source_url.startswith("https://")
+            ):
+                return
+            try:
+                create_resp = await MediaPostReverse.request(
+                    session,
+                    token,
+                    _resolve_media_post_type(media_type),
+                    source_url,
+                )
+                created_payload = create_resp.json() if create_resp is not None else {}
+                created_post_id = _extract_post_id(created_payload)
+                if created_post_id:
+                    post_text = created_post_id
+                    post_payload = created_payload
+                    post_obj = _payload_post(created_payload)
+                    logger.info(
+                        "MediaPost metadata fallback create succeeded: "
+                        f"source_url={source_url}, created_post_id={created_post_id}"
+                    )
+            except Exception as e:
+                logger.warning(
+                    "MediaPost metadata fallback create failed: "
+                    f"source_url={source_url}, error={e}"
+                )
+
+        post_obj: dict[str, Any] = {}
+        if should_create_before_get:
+            await _create_from_source_url()
+
+        if not post_obj:
+            try:
+                post_resp = await MediaPostReverse.get(session, token, post_text)
+                post_payload = post_resp.json() if post_resp is not None else {}
+                post_obj = _payload_post(post_payload)
+            except Exception as e:
+                logger.warning(f"MediaPost metadata get failed: post_id={post_text}, error={e}")
+
+        # If the probed id is not a real media post id, create one from final media URL first.
+        if not post_obj:
+            await _create_from_source_url()
+
         try:
-            post_resp = await MediaPostReverse.get(session, token, post_text)
-            post_payload = post_resp.json() if post_resp is not None else {}
-        except Exception as e:
-            logger.warning(f"MediaPost metadata get failed: post_id={post_text}, error={e}")
-        try:
-            share_resp = await MediaPostReverse.create_link(session, token, post_text)
-            share_payload = share_resp.json() if share_resp is not None else {}
-            if isinstance(share_payload, dict):
-                share_link = str(share_payload.get("shareLink") or "").strip()
+            if post_obj:
+                share_resp = await MediaPostReverse.create_link(session, token, post_text)
+                share_payload = share_resp.json() if share_resp is not None else {}
+                if isinstance(share_payload, dict):
+                    share_link = str(share_payload.get("shareLink") or "").strip()
         except Exception as e:
             logger.warning(f"MediaPost metadata create-link failed: post_id={post_text}, error={e}")
 
@@ -94,7 +163,7 @@ class MediaPostReverse:
             if match:
                 canonical_post_id = match.group(1)
 
-        post = post_payload.get("post", {}) if isinstance(post_payload, dict) else {}
+        post = _payload_post(post_payload)
         metadata: dict[str, Any] = {
             "post_id": canonical_post_id,
             "share_link": share_link,
