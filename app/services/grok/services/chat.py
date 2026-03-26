@@ -95,6 +95,179 @@ def extract_tool_text(raw: str, rollout_id: str = "") -> str:
     return re.sub(r"<[^>]+>", "", raw, flags=re.DOTALL).strip()
 
 
+def _tool_card_to_source_group(card_id: str, card: Dict[str, Any]) -> Dict[str, Any] | None:
+    if not card_id or not isinstance(card, dict):
+        return None
+
+    if web_search := card.get("webSearch"):
+        args = web_search.get("args") or {}
+        query = args.get("query") or args.get("q") or ""
+        return {
+            "tool_usage_card_id": card_id,
+            "kind": "web_search",
+            "query": query,
+            "results": [],
+        }
+
+    if image_search := card.get("imageSearch"):
+        args = image_search.get("args") or {}
+        query = (
+            args.get("imageDescription")
+            or args.get("image_description")
+            or args.get("query")
+            or ""
+        )
+        return {
+            "tool_usage_card_id": card_id,
+            "kind": "search_images",
+            "query": query,
+            "results": [],
+        }
+
+    return None
+
+
+def _normalize_source_results(items: Any) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or item.get("link") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        normalized.append(
+            {
+                "url": url,
+                "title": str(item.get("title") or "").strip(),
+                "preview": str(item.get("preview") or item.get("snippet") or "").strip(),
+            }
+        )
+    return normalized
+
+
+def _extract_card_attachment_sources(card_attachments: Any) -> Dict[str, List[Dict[str, str]]]:
+    citations: List[Dict[str, str]] = []
+    images: List[Dict[str, str]] = []
+    seen_citations: set[str] = set()
+    seen_images: set[str] = set()
+
+    for raw in card_attachments or []:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            card = orjson.loads(raw)
+        except orjson.JSONDecodeError:
+            continue
+        if not isinstance(card, dict):
+            continue
+
+        card_type = str(card.get("type") or "")
+        if card_type == "render_inline_citation":
+            url = str(card.get("url") or "").strip()
+            if url and url not in seen_citations:
+                seen_citations.add(url)
+                citations.append(
+                    {
+                        "url": url,
+                        "title": "",
+                    }
+                )
+            continue
+
+        if card_type == "render_searched_image":
+            image = card.get("image") or {}
+            url = str(image.get("link") or image.get("original") or "").strip()
+            if url and url not in seen_images:
+                seen_images.add(url)
+                images.append(
+                    {
+                        "url": url,
+                        "title": str(image.get("title") or "").strip(),
+                        "thumbnail": str(image.get("thumbnail") or "").strip(),
+                        "original": str(image.get("original") or "").strip(),
+                    }
+                )
+
+    return {"citations": citations, "images": images}
+
+
+def extract_sources_payload(model_response: Dict[str, Any]) -> Dict[str, Any] | None:
+    if not isinstance(model_response, dict):
+        return None
+
+    groups_by_id: Dict[str, Dict[str, Any]] = {}
+    group_order: List[str] = []
+
+    def ensure_group(card_id: str, card: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+        if not card_id:
+            return None
+        group = groups_by_id.get(card_id)
+        if group is None and isinstance(card, dict):
+            group = _tool_card_to_source_group(card_id, card)
+            if group:
+                groups_by_id[card_id] = group
+                group_order.append(card_id)
+        return group
+
+    for step in model_response.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+
+        for card in step.get("toolUsageCards") or []:
+            if not isinstance(card, dict):
+                continue
+            card_id = str(card.get("toolUsageCardId") or "").strip()
+            ensure_group(card_id, card)
+
+        for result in step.get("toolUsageResults") or []:
+            if not isinstance(result, dict):
+                continue
+            card_id = str(result.get("toolUsageCardId") or "").strip()
+            group = ensure_group(card_id)
+            if not group:
+                continue
+
+            web_results = ((result.get("webSearchResults") or {}).get("results")) or []
+            normalized = _normalize_source_results(web_results)
+            if normalized:
+                group["results"] = normalized
+
+    if not groups_by_id:
+        fallback_results = _normalize_source_results(
+            ((model_response.get("webSearchResults") or {}).get("results")) or []
+        )
+        if fallback_results:
+            groups_by_id["__fallback__"] = {
+                "tool_usage_card_id": "__fallback__",
+                "kind": "web_search",
+                "query": "",
+                "results": fallback_results,
+            }
+            group_order.append("__fallback__")
+
+    attachments = _extract_card_attachment_sources(model_response.get("cardAttachmentsJson"))
+    groups = [groups_by_id[group_id] for group_id in group_order if groups_by_id.get(group_id)]
+    payload = {
+        "groups": groups,
+        "citations": attachments["citations"],
+        "images": attachments["images"],
+    }
+    if payload["groups"] or payload["citations"] or payload["images"]:
+        return payload
+    return None
+
+
+def extract_render_payload(model_response: Dict[str, Any]) -> Dict[str, Any] | None:
+    if not isinstance(model_response, dict) or not model_response:
+        return None
+    return {
+        "rawModelResponse": model_response,
+        "extraImages": proc_base._collect_images(model_response),
+    }
+
+
 def _get_chat_semaphore() -> asyncio.Semaphore:
     global _CHAT_SEMAPHORE, _CHAT_SEM_VALUE
     value = max(1, int(get_config("chat.concurrent")))
@@ -553,9 +726,8 @@ class StreamProcessor(proc_base.BaseProcessor):
         self.rollout_id: str = ""
         self.fingerprint: str = ""
         self.think_opened: bool = False
-        self.seen_think_once: bool = False
+        self.think_closed_once: bool = False
         self.image_think_active: bool = False
-        self.answer_buffer: list[str] = []
         self.role_sent: bool = False
         self.filter_tags = get_config("app.filter_tags")
         self.tool_usage_enabled = (
@@ -573,6 +745,10 @@ class StreamProcessor(proc_base.BaseProcessor):
         self._tool_partial = ""
         self._tool_calls_seen = False
         self._tool_call_index = 0
+        self._source_groups: Dict[str, Dict[str, Any]] = {}
+        self._source_order: List[str] = []
+        self._citation_sources: List[Dict[str, str]] = []
+        self._image_sources: List[Dict[str, str]] = []
 
     def _filter_tool_card(self, token: str) -> str:
         if not token or not self.tool_usage_enabled:
@@ -737,6 +913,8 @@ class StreamProcessor(proc_base.BaseProcessor):
         role: str = None,
         finish: str = None,
         tool_calls: list = None,
+        sources: Dict[str, Any] = None,
+        rendering: Dict[str, Any] = None,
     ) -> str:
         """Build SSE response."""
         delta = {}
@@ -758,7 +936,46 @@ class StreamProcessor(proc_base.BaseProcessor):
                 {"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}
             ],
         }
+        if sources is not None:
+            chunk["sources"] = sources
+        if rendering is not None:
+            chunk["rendering"] = rendering
         return f"data: {orjson.dumps(chunk).decode()}\n\n"
+
+    def _ensure_source_group(
+        self, card_id: str, card: Dict[str, Any] | None = None
+    ) -> Dict[str, Any] | None:
+        if not card_id:
+            return None
+        group = self._source_groups.get(card_id)
+        if group is None and isinstance(card, dict):
+            group = _tool_card_to_source_group(card_id, card)
+            if group:
+                self._source_groups[card_id] = group
+                self._source_order.append(card_id)
+        return group
+
+    def _sources_payload(self) -> Dict[str, Any] | None:
+        groups = [
+            self._source_groups[group_id]
+            for group_id in self._source_order
+            if self._source_groups.get(group_id)
+        ]
+        payload = {
+            "groups": groups,
+            "citations": self._citation_sources,
+            "images": self._image_sources,
+        }
+        if payload["groups"] or payload["citations"] or payload["images"]:
+            return payload
+        return None
+
+    async def _close_think_block(self) -> AsyncGenerator[str, None]:
+        """Close the visible think block before emitting normal answer content."""
+        if self.think_opened:
+            yield self._sse("\n</think>\n")
+            self.think_opened = False
+            self.think_closed_once = True
 
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """Process stream response.
@@ -807,7 +1024,6 @@ class StreamProcessor(proc_base.BaseProcessor):
                     if not self.think_opened:
                         yield self._sse("<think>\n")
                         self.think_opened = True
-                    self.seen_think_once = True
                     idx = img.get("imageIndex", 0) + 1
                     progress = img.get("progress", 0)
                     yield self._sse(
@@ -816,6 +1032,12 @@ class StreamProcessor(proc_base.BaseProcessor):
                     continue
 
                 if mr := resp.get("modelResponse"):
+                    render_payload = extract_render_payload(mr)
+                    if render_payload:
+                        yield self._sse(rendering=render_payload)
+                    if self.image_think_active and self.think_opened:
+                        async for chunk in self._close_think_block():
+                            yield chunk
                     self.image_think_active = False
                     for url in proc_base._collect_images(mr):
                         parts = url.split("/")
@@ -842,19 +1064,67 @@ class StreamProcessor(proc_base.BaseProcessor):
                         except orjson.JSONDecodeError:
                             card_data = None
                         if isinstance(card_data, dict):
+                            attachments = _extract_card_attachment_sources([json_data])
+                            if attachments["citations"]:
+                                seen = {item.get("url") for item in self._citation_sources}
+                                for item in attachments["citations"]:
+                                    if item.get("url") and item.get("url") not in seen:
+                                        seen.add(item["url"])
+                                        self._citation_sources.append(item)
+                            if attachments["images"]:
+                                seen = {item.get("url") for item in self._image_sources}
+                                for item in attachments["images"]:
+                                    if item.get("url") and item.get("url") not in seen:
+                                        seen.add(item["url"])
+                                        self._image_sources.append(item)
                             image = card_data.get("image") or {}
                             original = image.get("original")
                             title = image.get("title") or ""
+                            if not original and "image_chunk" in card_data:
+                                original = card_data["image_chunk"].get("imageUrl")
+                                if not title:
+                                    title = card_data["image_chunk"].get("imageTitle") or "Generated Image"
                             if original:
+                                async for chunk in self._close_think_block():
+                                    yield chunk
                                 title_safe = title.replace("\n", " ").strip()
-                                if title_safe:
-                                    yield self._sse(f"![{title_safe}]({original})\n")
+                                dl_service = getattr(self, "_get_dl", lambda: None)()
+                                if dl_service:
+                                    img_id = title_safe if title_safe else "image"
+                                    rendered = await dl_service.render_image(original, self.token, img_id)
+                                    yield self._sse(f"{rendered}\n")
                                 else:
-                                    yield self._sse(f"![image]({original})\n")
+                                    if not original.startswith("http"):
+                                        original = f"https://assets.grok.com/{original.lstrip('/')}"
+                                    img_id = title_safe if title_safe else "image"
+                                    yield self._sse(f"![{img_id}]({original})\n")
+                    continue
+
+                if tool_card := resp.get("toolUsageCard"):
+                    card_id = str(
+                        resp.get("toolUsageCardId") or tool_card.get("toolUsageCardId") or ""
+                    ).strip()
+                    self._ensure_source_group(card_id, tool_card)
+                    sources_payload = self._sources_payload()
+                    if sources_payload:
+                        yield self._sse(sources=sources_payload)
+
+                if resp.get("messageTag") == "raw_function_result":
+                    card_id = str(resp.get("toolUsageCardId") or "").strip()
+                    group = self._ensure_source_group(card_id)
+                    web_results = ((resp.get("webSearchResults") or {}).get("results")) or []
+                    normalized = _normalize_source_results(web_results)
+                    if group is not None and normalized:
+                        group["results"] = normalized
+                        sources_payload = self._sources_payload()
+                        if sources_payload:
+                            yield self._sse(sources=sources_payload)
                     continue
 
                 if (token := resp.get("token")) is not None:
                     if not token:
+                        continue
+                    if is_thinking and self.think_closed_once and not self.image_think_active:
                         continue
                     filtered = self._filter_token(token)
                     if not filtered:
@@ -864,7 +1134,7 @@ class StreamProcessor(proc_base.BaseProcessor):
                     if not filtered:
                         continue
                     in_think = (
-                        is_thinking
+                        (is_thinking and not self.think_closed_once)
                         or self.image_think_active
                     )
                     if in_think:
@@ -873,14 +1143,11 @@ class StreamProcessor(proc_base.BaseProcessor):
                         if not self.think_opened:
                             yield self._sse("<think>\n")
                             self.think_opened = True
-                        self.seen_think_once = True
                         yield self._sse(filtered)
                         continue
-
-                    # 一旦进入思考模式，先缓存正文，等思考结束后再统一输出
-                    if self.show_think and self.seen_think_once:
-                        self.answer_buffer.append(filtered)
-                        continue
+                    if self.think_opened:
+                        async for chunk in self._close_think_block():
+                            yield chunk
 
                     if self._tool_stream_enabled:
                         for kind, payload in self._handle_tool_stream(filtered):
@@ -893,32 +1160,16 @@ class StreamProcessor(proc_base.BaseProcessor):
                     yield self._sse(filtered)
 
             if self.think_opened:
-                yield self._sse("</think>\n")
-                self.think_opened = False
-            if self.answer_buffer:
-                buffered = "".join(self.answer_buffer)
-                if self._tool_stream_enabled:
-                    for kind, payload in self._handle_tool_stream(buffered):
-                        if kind == "text":
-                            yield self._sse(payload)
-                        elif kind == "tool":
-                            yield self._sse(tool_calls=[payload])
-                    for kind, payload in self._flush_tool_stream():
-                        if kind == "text":
-                            yield self._sse(payload)
-                        elif kind == "tool":
-                            yield self._sse(tool_calls=[payload])
-                else:
-                    yield self._sse(buffered)
-                self.answer_buffer = []
-            if self._tool_stream_enabled and not self.answer_buffer:
+                async for chunk in self._close_think_block():
+                    yield chunk
+            if self._tool_stream_enabled:
                 for kind, payload in self._flush_tool_stream():
                     if kind == "text":
                         yield self._sse(payload)
                     elif kind == "tool":
                         yield self._sse(tool_calls=[payload])
             finish_reason = "tool_calls" if self._tool_stream_enabled and self._tool_calls_seen else "stop"
-            yield self._sse(finish=finish_reason)
+            yield self._sse(finish=finish_reason, sources=self._sources_payload())
             yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
             logger.debug("Stream cancelled by client", extra={"model": self.model})
@@ -1021,6 +1272,7 @@ class CollectProcessor(proc_base.BaseProcessor):
         response_id = ""
         fingerprint = ""
         content = ""
+        final_model_response: Dict[str, Any] = {}
         idle_timeout = get_config("chat.stream_timeout")
         first_item_timeout = get_config("chat.first_token_timeout")
 
@@ -1042,6 +1294,7 @@ class CollectProcessor(proc_base.BaseProcessor):
                     fingerprint = llm.get("modelHash", "")
 
                 if mr := resp.get("modelResponse"):
+                    final_model_response = mr
                     response_id = mr.get("responseId", "")
                     content = mr.get("message", "")
 
@@ -1134,6 +1387,8 @@ class CollectProcessor(proc_base.BaseProcessor):
                 content = text_content
                 finish_reason = "tool_calls"
 
+        sources_payload = extract_sources_payload(final_model_response)
+        render_payload = extract_render_payload(final_model_response)
         message_obj = {
             "role": "assistant",
             "content": content,
@@ -1142,6 +1397,10 @@ class CollectProcessor(proc_base.BaseProcessor):
         }
         if tool_calls_result:
             message_obj["tool_calls"] = tool_calls_result
+        if sources_payload:
+            message_obj["sources"] = sources_payload
+        if render_payload:
+            message_obj["rendering"] = render_payload
 
         return {
             "id": response_id,

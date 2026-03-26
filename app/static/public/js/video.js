@@ -65,6 +65,7 @@
   const referenceLightboxImg = document.getElementById('referenceLightboxImg');
   const closeReferenceLightboxBtn = document.getElementById('closeReferenceLightboxBtn');
   const historyCount = document.getElementById('historyCount');
+  const videoHistoryReverseBtn = document.getElementById('videoHistoryReverseBtn');
   const editPreviewWrap = editVideo ? editVideo.closest('.edit-preview-wrap') : null;
 
   let taskStates = new Map();
@@ -132,6 +133,7 @@
   let workspaceLockedHeight = 0;
   let editVideoNameTapTimer = 0;
   let editVideoNameTapCount = 0;
+  let videoHistoryReversed = false;
 
   function buildHistoryTitle(type, serial) {
     const n = Math.max(1, parseInt(String(serial || '1'), 10) || 1);
@@ -591,13 +593,16 @@
     if (!spliceBtn) return;
     const iconExtend = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>';
     const iconStop = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="5" width="14" height="14"/></svg>';
+    spliceBtn.classList.remove('is-running', 'is-stopping');
     if (state === 'running') {
       spliceBtn.disabled = false;
+      spliceBtn.classList.add('is-running');
       spliceBtn.innerHTML = `${iconStop}<span>中止延长</span>`;
       return;
     }
     if (state === 'stopping') {
       spliceBtn.disabled = true;
+      spliceBtn.classList.add('is-stopping');
       spliceBtn.innerHTML = `${iconStop}<span>中止中...</span>`;
       return;
     }
@@ -622,6 +627,15 @@
     if (!historyCount || !videoStage) return;
     const count = videoStage.querySelectorAll('.video-item').length;
     historyCount.textContent = String(count);
+    if (videoHistoryReverseBtn) {
+      videoHistoryReverseBtn.textContent = videoHistoryReversed ? '正序显示' : '倒序显示';
+      videoHistoryReverseBtn.setAttribute('aria-pressed', videoHistoryReversed ? 'true' : 'false');
+    }
+  }
+
+  function syncVideoHistoryOrder() {
+    if (!videoStage) return;
+    videoStage.classList.toggle('is-reversed', videoHistoryReversed);
   }
 
   function removePreviewItem(item) {
@@ -1569,6 +1583,7 @@
     if (videoEmpty) {
       videoEmpty.classList.add('hidden');
     }
+    syncVideoHistoryOrder();
     updateHistoryCount();
     return item;
   }
@@ -3336,6 +3351,14 @@
     });
   }
 
+  if (videoHistoryReverseBtn) {
+    videoHistoryReverseBtn.addEventListener('click', () => {
+      videoHistoryReversed = !videoHistoryReversed;
+      syncVideoHistoryOrder();
+      updateHistoryCount();
+    });
+  }
+
   if (imageFileInput) {
     imageFileInput.addEventListener('change', async () => {
       const files = imageFileInput.files ? Array.from(imageFileInput.files) : [];
@@ -3654,6 +3677,7 @@
     });
 
   updateMeta();
+  syncVideoHistoryOrder();
   updateHistoryCount();
   refreshAllDeleteZoneTracks();
   syncTimelineAvailability();
@@ -3794,9 +3818,8 @@
       if (playIcon) playIcon.style.display = running ? 'none' : '';
       if (stopIcon) stopIcon.style.display = running ? '' : 'none';
       if (label) label.textContent = running ? '停止' : '开始生成';
-      // 切换样式：running 时改为 outline 风格
       mobileStart.className = running
-        ? 'geist-button-outline mobile-action-btn gap-2'
+        ? 'geist-button mobile-action-btn gap-2 is-stop'
         : 'geist-button mobile-action-btn gap-2';
       mobileStart.disabled = !running && Boolean(startBtn && startBtn.disabled);
     }
@@ -3828,9 +3851,9 @@
     function syncSpliceBtnState() {
       if (!mobileSplice || !spliceBtn) return;
       mobileSplice.disabled = spliceBtn.disabled;
-      const span = spliceBtn.querySelector('span');
-      const mSpan = mobileSplice.querySelector('span');
-      if (span && mSpan) mSpan.textContent = span.textContent;
+      mobileSplice.classList.toggle('is-running', spliceBtn.classList.contains('is-running'));
+      mobileSplice.classList.toggle('is-stopping', spliceBtn.classList.contains('is-stopping'));
+      mobileSplice.innerHTML = spliceBtn.innerHTML;
     }
     if (spliceBtn) {
       new MutationObserver(syncSpliceBtnState)

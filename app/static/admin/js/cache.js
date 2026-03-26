@@ -35,6 +35,7 @@ const UI_MAP = {
   selectedCount: 'selected-count',
   batchActions: 'batch-actions',
   loadBtn: 'btn-load-stats',
+  downloadBtn: 'btn-download-assets',
   deleteBtn: 'btn-delete-assets',
   localCacheLists: 'local-cache-lists',
   localImageList: 'local-image-list',
@@ -804,6 +805,19 @@ function updateLoadButton() {
   }
 }
 
+function updateDownloadButton() {
+  const btn = ui.downloadBtn;
+  if (!btn) return;
+  if (currentSection === 'online') {
+    btn.classList.add('hidden');
+    btn.title = '';
+  } else {
+    btn.classList.remove('hidden');
+    btn.textContent = '下载';
+    btn.title = '';
+  }
+}
+
 function updateDeleteButton() {
   const btn = ui.deleteBtn;
   if (!btn) return;
@@ -819,6 +833,7 @@ function updateDeleteButton() {
 
 function setActionButtonsState() {
   const loadBtn = ui.loadBtn;
+  const downloadBtn = ui.downloadBtn;
   const deleteBtn = ui.deleteBtn;
   const disabled = isBatchLoading || isBatchDeleting || isLocalDeleting;
   const noSelection = getActiveSelectedSet().size === 0;
@@ -835,6 +850,9 @@ function setActionButtonsState() {
     } else {
       deleteBtn.disabled = disabled || noSelection;
     }
+  }
+  if (downloadBtn) {
+    downloadBtn.disabled = currentSection === 'online' || disabled || noSelection;
   }
 }
 
@@ -889,6 +907,7 @@ function getActiveSelectedSet() {
 
 function updateToolbarForSection() {
   updateLoadButton();
+  updateDownloadButton();
   updateDeleteButton();
   updateSelectedCount();
   updateBatchProgress();
@@ -1108,6 +1127,85 @@ function viewLocalFile(type, name) {
   window.open(url, '_blank');
 }
 
+function buildLocalFileUrl(type, name) {
+  const safeName = encodeURIComponent(name);
+  return type === 'image' ? `/v1/files/image/${safeName}` : `/v1/files/video/${safeName}`;
+}
+
+function isIosBrowser() {
+  const ua = String(navigator.userAgent || '');
+  const platform = String(navigator.platform || '');
+  return /iPad|iPhone|iPod/.test(ua) || (platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+
+function inferMimeFromName(type, name) {
+  const lower = String(name || '').toLowerCase();
+  if (type === 'video') return 'video/mp4';
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  return 'image/jpeg';
+}
+
+async function fetchLocalFileAsShareFile(type, name) {
+  const url = buildLocalFileUrl(type, name);
+  const res = await fetch(url, {
+    headers: buildAuthHeaders(apiKey)
+  });
+  if (!res.ok) {
+    throw new Error('download_fetch_failed');
+  }
+  const blob = await res.blob();
+  const mime = blob.type || inferMimeFromName(type, name);
+  return new File([blob], name, { type: mime });
+}
+
+function triggerBrowserDownload(url, filename) {
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename || '';
+  link.rel = 'noopener';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+async function downloadSelectedLocal(type) {
+  const selected = selectedLocal[type];
+  const names = selected ? Array.from(selected) : [];
+  if (names.length === 0) {
+    showToast('未选择文件', 'info');
+    return;
+  }
+  if (isIosBrowser()) {
+    try {
+      const files = await Promise.all(names.map(name => fetchLocalFileAsShareFile(type, name)));
+      if (navigator.share && navigator.canShare && navigator.canShare({ files })) {
+        await navigator.share({
+          files,
+          title: names.length > 1 ? '缓存文件' : names[0]
+        });
+        showToast(`已调用系统分享：${names.length} 个文件`, 'success');
+        return;
+      }
+    } catch (error) {
+      console.warn('iOS share download failed:', error);
+    }
+    if (names.length === 1) {
+      window.location.href = buildLocalFileUrl(type, names[0]);
+      showToast('已打开文件，请使用系统分享保存', 'info');
+    } else {
+      showToast('当前 iOS 浏览器不支持直接批量下载，请改为单选下载或使用分享保存', 'info');
+    }
+    return;
+  }
+  names.forEach((name, index) => {
+    window.setTimeout(() => {
+      triggerBrowserDownload(buildLocalFileUrl(type, name), name);
+    }, index * 120);
+  });
+  showToast(`已发起 ${names.length} 个文件下载`, 'success');
+}
+
 async function deleteLocalFile(type, name) {
   const ok = await confirmAction(`确定要删除该文件吗？`, { okText: '删除' });
   if (!ok) return;
@@ -1207,6 +1305,19 @@ function handleDeleteClick() {
   } else {
     deleteSelectedLocal(currentSection);
   }
+}
+
+function handleDownloadClick() {
+  ensureUI();
+  if (isBatchLoading || isBatchDeleting || isLocalDeleting) {
+    showToast('当前有任务进行中', 'info');
+    return;
+  }
+  if (currentSection === 'online') {
+    showToast('在线资产暂不支持批量下载', 'info');
+    return;
+  }
+  downloadSelectedLocal(currentSection);
 }
 
 function stopBatchLoad(options = {}) {
