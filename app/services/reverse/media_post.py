@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 
 from app.core.logger import logger
@@ -41,6 +42,58 @@ class MediaPostReverse:
         path = DATA_DIR / "tmp" / "media-meta"
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    @staticmethod
+    def _resolve_media_post_type(value: str) -> str:
+        raw = str(value or "").strip().upper()
+        if raw in {"MEDIA_POST_TYPE_IMAGE", "MEDIA_POST_TYPE_VIDEO"}:
+            return raw
+        if raw in {"IMAGE", "IMG"}:
+            return "MEDIA_POST_TYPE_IMAGE"
+        if raw in {"VIDEO", "VID"}:
+            return "MEDIA_POST_TYPE_VIDEO"
+        return "MEDIA_POST_TYPE_IMAGE"
+
+    @staticmethod
+    def _normalize_source_media_url(value: str, *, preserve_data_uri: bool = False) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith("data:"):
+            return raw if preserve_data_uri else ""
+        marker = "/v1/files/image/"
+        if raw.startswith("http://") or raw.startswith("https://"):
+            try:
+                parsed = urlparse(raw)
+            except Exception:
+                return raw
+            path = str(parsed.path or "").strip()
+            if marker in path:
+                suffix = path.split(marker, 1)[1].lstrip("/")
+                return f"https://assets.grok.com/{suffix}" if suffix else ""
+            return raw
+        if raw.startswith(marker):
+            suffix = raw.split(marker, 1)[1].lstrip("/")
+            return f"https://assets.grok.com/{suffix}" if suffix else ""
+        if raw.startswith("/users/") or raw.startswith("users/"):
+            return f"https://assets.grok.com/{raw.lstrip('/')}"
+        return raw
+
+    @staticmethod
+    def _extract_media_source_post_id(value: str) -> str:
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return ""
+        for pattern in (
+            r"/generated/([0-9a-f-]{32,36})(?:/|$)",
+            r"/users/[^/]+/([0-9a-f-]{32,36})(?:/content|/|$)",
+            r"/imagine-public/images/([0-9a-f-]{32,36})(?:\.jpg|/|$)",
+            r"/imagine-public/share-images/([0-9a-f-]{32,36})(?:\.jpg|\.png|/|$)",
+        ):
+            match = re.search(pattern, raw)
+            if match:
+                return match.group(1)
+        return ""
 
     @staticmethod
     async def write_metadata(post_id: str, metadata: dict[str, Any]) -> Path | None:
@@ -82,24 +135,30 @@ class MediaPostReverse:
 
         def _extract_post_id(data: dict[str, Any]) -> str:
             return str(_payload_post(data).get("id") or "").strip()
-
-        def _resolve_media_post_type(value: str) -> str:
-            raw = str(value or "").strip().upper()
-            if raw in {"MEDIA_POST_TYPE_IMAGE", "MEDIA_POST_TYPE_VIDEO"}:
-                return raw
-            if raw in {"IMAGE", "IMG"}:
-                return "MEDIA_POST_TYPE_IMAGE"
-            if raw in {"VIDEO", "VID"}:
-                return "MEDIA_POST_TYPE_VIDEO"
-            return "MEDIA_POST_TYPE_IMAGE"
-
-        source_url = str(local_url or "").strip()
+        source_url = MediaPostReverse._normalize_source_media_url(local_url)
+        if not (source_url.startswith("http://") or source_url.startswith("https://")):
+            fallback_thumbnail = MediaPostReverse._normalize_source_media_url(thumbnail_url)
+            if fallback_thumbnail.startswith("http://") or fallback_thumbnail.startswith("https://"):
+                source_url = fallback_thumbnail
+            elif (
+                MediaPostReverse._resolve_media_post_type(media_type) == "MEDIA_POST_TYPE_IMAGE"
+                and re.fullmatch(r"[0-9a-fA-F-]{32,36}", post_text)
+            ):
+                source_url = f"https://imagine-public.x.ai/imagine-public/images/{post_text}.jpg"
         source_url_lower = source_url.lower()
+        source_hint_post_id = MediaPostReverse._extract_media_source_post_id(source_url)
+        post_text_lower = post_text.lower()
         should_create_before_get = bool(
             source_url
             and (
-                f"/generated/{post_text.lower()}" in source_url_lower
-                or f"/users/" in source_url_lower and f"/{post_text.lower()}/content" in source_url_lower
+                (source_hint_post_id and source_hint_post_id != post_text_lower)
+                or f"/generated/{post_text_lower}" in source_url_lower
+                or (
+                    "/users/" in source_url_lower
+                    and f"/{post_text_lower}/content" in source_url_lower
+                )
+                or f"/imagine-public/images/{post_text_lower}" in source_url_lower
+                or f"/imagine-public/share-images/{post_text_lower}" in source_url_lower
             )
         )
 
@@ -113,7 +172,7 @@ class MediaPostReverse:
                 create_resp = await MediaPostReverse.request(
                     session,
                     token,
-                    _resolve_media_post_type(media_type),
+                    MediaPostReverse._resolve_media_post_type(media_type),
                     source_url,
                 )
                 created_payload = create_resp.json() if create_resp is not None else {}
@@ -255,8 +314,14 @@ class MediaPostReverse:
 
             # Build payload
             payload = {"mediaType": mediaType}
-            if mediaUrl:
-                payload["mediaUrl"] = mediaUrl
+            normalized_media_url = str(mediaUrl or "").strip()
+            if MediaPostReverse._resolve_media_post_type(mediaType) == "MEDIA_POST_TYPE_IMAGE":
+                normalized_media_url = MediaPostReverse._normalize_source_media_url(
+                    normalized_media_url,
+                    preserve_data_uri=True,
+                )
+            if normalized_media_url:
+                payload["mediaUrl"] = normalized_media_url
             if prompt:
                 payload["prompt"] = prompt
             logger.info(
