@@ -4,11 +4,13 @@
 
 import asyncio
 import time
-from typing import Any, AsyncGenerator, Optional, AsyncIterable, List, TypeVar
+from typing import Any, AsyncGenerator, AsyncIterable, List, Optional, TypeVar
+
+import orjson
 
 from app.core.config import get_config
-from app.core.logger import logger
 from app.core.exceptions import StreamIdleTimeoutError
+from app.core.logger import logger
 from app.services.grok.utils.download import DownloadService
 
 
@@ -44,11 +46,81 @@ def _collect_images(obj: Any) -> List[str]:
     urls: List[str] = []
     seen = set()
 
-    def add(url: str):
-        if not url or url in seen:
+    def _to_assets_url(raw_url: Any) -> str:
+        raw = str(raw_url or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith("http://") or raw.startswith("https://") or raw.startswith("data:"):
+            return raw
+        if raw.startswith("/"):
+            return f"https://assets.grok.com{raw}"
+        return f"https://assets.grok.com/{raw}"
+
+    def add(url: Any, *, normalize_assets: bool = False):
+        text = str(url or "").strip()
+        if not text:
             return
-        seen.add(url)
-        urls.append(url)
+        if normalize_assets:
+            text = _to_assets_url(text)
+        if not text or text in seen:
+            return
+        seen.add(text)
+        urls.append(text)
+
+    def _add_image_chunk_urls(payload: Any):
+        if not isinstance(payload, dict):
+            return
+        image_chunk = payload.get("image_chunk")
+        entries: List[dict] = []
+        if isinstance(image_chunk, dict):
+            entries.append(image_chunk)
+        elif isinstance(image_chunk, list):
+            entries.extend([item for item in image_chunk if isinstance(item, dict)])
+
+        for entry in entries:
+            progress = entry.get("progress")
+            if progress is not None:
+                try:
+                    if float(progress) < 100:
+                        continue
+                except (TypeError, ValueError):
+                    if str(progress).strip() != "100":
+                        continue
+            add(entry.get("imageUrl") or entry.get("url"), normalize_assets=True)
+
+    def _parse_card(raw_card: Any) -> dict | None:
+        if isinstance(raw_card, dict):
+            return raw_card
+        if isinstance(raw_card, str) and raw_card.strip():
+            try:
+                parsed = orjson.loads(raw_card)
+            except orjson.JSONDecodeError:
+                return None
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    def _extract_generated_card_images(card: dict):
+        card_type = str(card.get("type") or "").strip()
+        card_kind = str(card.get("cardType") or "").strip()
+        is_generated = (
+            card_type == "render_generated_image"
+            or card_type == "render_edited_image"
+            or card_kind == "generated_image_card"
+        )
+        if not is_generated:
+            return
+
+        _add_image_chunk_urls(card)
+
+        json_data = card.get("jsonData")
+        parsed_json_data: Any = json_data
+        if isinstance(json_data, str) and json_data.strip():
+            try:
+                parsed_json_data = orjson.loads(json_data)
+            except orjson.JSONDecodeError:
+                parsed_json_data = None
+        _add_image_chunk_urls(parsed_json_data)
 
     def walk(value: Any):
         if isinstance(value, dict):
@@ -56,10 +128,20 @@ def _collect_images(obj: Any) -> List[str]:
                 if key in {"generatedImageUrls", "imageUrls", "imageURLs"}:
                     if isinstance(item, list):
                         for url in item:
-                            if isinstance(url, str):
-                                add(url)
-                    elif isinstance(item, str):
+                            add(url)
+                    else:
                         add(item)
+                    continue
+                if key == "cardAttachment":
+                    card = _parse_card(item)
+                    if card:
+                        _extract_generated_card_images(card)
+                    continue
+                if key == "cardAttachmentsJson" and isinstance(item, list):
+                    for raw_card in item:
+                        card = _parse_card(raw_card)
+                        if card:
+                            _extract_generated_card_images(card)
                     continue
                 walk(item)
         elif isinstance(value, list):
@@ -81,7 +163,7 @@ async def _with_idle_timeout(
 
     Args:
         iterable: 原始异步迭代器
-        idle_timeout: 空闲超时时间(秒)，0 表示禁用
+        idle_timeout: 空闲超时时间(秒), 0 表示禁用
         model: 模型名称(用于日志)
     """
     try:
@@ -173,3 +255,4 @@ __all__ = [
     "_collect_images",
     "_is_http2_error",
 ]
+

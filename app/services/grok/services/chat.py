@@ -176,9 +176,16 @@ def _extract_card_attachment_sources(card_attachments: Any) -> Dict[str, List[Di
                 )
             continue
 
-        if card_type == "render_searched_image":
+        if (
+            card_type in {"render_searched_image", "render_edited_image", "render_generated_image"}
+            or str(card.get("cardType") or "").strip() == "generated_image_card"
+        ):
             image = card.get("image") or {}
             url = str(image.get("link") or image.get("original") or "").strip()
+            if not url:
+                extracted = proc_base._collect_images({"cardAttachment": card})
+                if extracted:
+                    url = str(extracted[0] or "").strip()
             if url and url not in seen_images:
                 seen_images.add(url)
                 images.append(
@@ -186,7 +193,7 @@ def _extract_card_attachment_sources(card_attachments: Any) -> Dict[str, List[Di
                         "url": url,
                         "title": str(image.get("title") or "").strip(),
                         "thumbnail": str(image.get("thumbnail") or "").strip(),
-                        "original": str(image.get("original") or "").strip(),
+                        "original": str(image.get("original") or url).strip(),
                     }
                 )
 
@@ -1057,47 +1064,37 @@ class StreamProcessor(proc_base.BaseProcessor):
                     continue
 
                 if card := resp.get("cardAttachment"):
-                    json_data = card.get("jsonData")
-                    if isinstance(json_data, str) and json_data.strip():
-                        try:
-                            card_data = orjson.loads(json_data)
-                        except orjson.JSONDecodeError:
-                            card_data = None
-                        if isinstance(card_data, dict):
-                            attachments = _extract_card_attachment_sources([json_data])
-                            if attachments["citations"]:
-                                seen = {item.get("url") for item in self._citation_sources}
-                                for item in attachments["citations"]:
-                                    if item.get("url") and item.get("url") not in seen:
-                                        seen.add(item["url"])
-                                        self._citation_sources.append(item)
-                            if attachments["images"]:
-                                seen = {item.get("url") for item in self._image_sources}
-                                for item in attachments["images"]:
-                                    if item.get("url") and item.get("url") not in seen:
-                                        seen.add(item["url"])
-                                        self._image_sources.append(item)
-                            image = card_data.get("image") or {}
-                            original = image.get("original")
-                            title = image.get("title") or ""
-                            if not original and "image_chunk" in card_data:
-                                original = card_data["image_chunk"].get("imageUrl")
-                                if not title:
-                                    title = card_data["image_chunk"].get("imageTitle") or "Generated Image"
-                            if original:
-                                async for chunk in self._close_think_block():
-                                    yield chunk
-                                title_safe = title.replace("\n", " ").strip()
-                                dl_service = getattr(self, "_get_dl", lambda: None)()
-                                if dl_service:
-                                    img_id = title_safe if title_safe else "image"
-                                    rendered = await dl_service.render_image(original, self.token, img_id)
-                                    yield self._sse(f"{rendered}\n")
-                                else:
-                                    if not original.startswith("http"):
-                                        original = f"https://assets.grok.com/{original.lstrip('/')}"
-                                    img_id = title_safe if title_safe else "image"
-                                    yield self._sse(f"![{img_id}]({original})\n")
+                    attachments = {"citations": [], "images": []}
+                    try:
+                        raw_card = orjson.dumps(card).decode()
+                        attachments = _extract_card_attachment_sources([raw_card])
+                    except Exception:
+                        pass
+                    if attachments["citations"]:
+                        seen = {item.get("url") for item in self._citation_sources}
+                        for item in attachments["citations"]:
+                            if item.get("url") and item.get("url") not in seen:
+                                seen.add(item["url"])
+                                self._citation_sources.append(item)
+                    if attachments["images"]:
+                        seen = {item.get("url") for item in self._image_sources}
+                        for item in attachments["images"]:
+                            if item.get("url") and item.get("url") not in seen:
+                                seen.add(item["url"])
+                                self._image_sources.append(item)
+
+                    image_urls = proc_base._collect_images({"cardAttachment": card})
+                    if image_urls:
+                        async for chunk in self._close_think_block():
+                            yield chunk
+                        for index, original in enumerate(image_urls):
+                            img_id = f"image-{index + 1}" if len(image_urls) > 1 else "image"
+                            dl_service = getattr(self, "_get_dl", lambda: None)()
+                            if dl_service:
+                                rendered = await dl_service.render_image(original, self.token, img_id)
+                                yield self._sse(f"{rendered}\n")
+                            else:
+                                yield self._sse(f"![{img_id}]({original})\n")
                     continue
 
                 if tool_card := resp.get("toolUsageCard"):

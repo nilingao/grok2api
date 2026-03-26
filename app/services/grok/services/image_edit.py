@@ -273,6 +273,22 @@ def _log_final_image_edit_payload(
     logger.info(f"Image edit upstream payload before send:\n{payload_text}")
 
 
+def _build_image_edit_tool_overrides() -> dict[str, Any]:
+    """Use browser-aligned edit tool overrides to avoid web-search fallback."""
+    return {
+        "imageGen": True,
+        "webSearch": False,
+    }
+
+
+def _build_image_edit_request_overrides() -> dict[str, Any]:
+    """Match browser behavior for image edit requests."""
+    return {
+        "disableMemory": False,
+        "temporary": False,
+    }
+
+
 def _is_assets_content_url(url: str) -> bool:
     raw = str(url or "").strip()
     if not raw:
@@ -444,18 +460,20 @@ class ImageEditService:
                         "parentPostId"
                     ] = parent_post_id
 
-                tool_overrides = {"imageGen": True}
+                tool_overrides = _build_image_edit_tool_overrides()
+                request_overrides = _build_image_edit_request_overrides()
 
                 if stream:
                     response = await GrokChatService().chat(
                         token=current_token,
                         message=prompt,
                         model=model_info.grok_model,
-                        mode=None,
+                        mode=model_info.model_mode,
                         stream=True,
                         tool_overrides=tool_overrides,
                         model_config_override=model_config_override,
                         image_generation_count=1,
+                        request_overrides=request_overrides,
                     )
                     processor = ImageStreamProcessor(
                         model_info.model_id,
@@ -488,6 +506,7 @@ class ImageEditService:
                     response_format=response_format,
                     tool_overrides=tool_overrides,
                     model_config_override=model_config_override,
+                    request_overrides=request_overrides,
                     return_all_images=return_all_images,
                     progress_cb=progress_cb,
                 )
@@ -657,18 +676,20 @@ class ImageEditService:
                         },
                     }
                 }
-                tool_overrides = {"imageGen": True}
+                tool_overrides = _build_image_edit_tool_overrides()
+                request_overrides = _build_image_edit_request_overrides()
 
                 if stream:
                     response = await GrokChatService().chat(
                         token=current_token,
                         message=prompt,
                         model=model_info.grok_model,
-                        mode=None,
+                        mode=model_info.model_mode,
                         stream=True,
                         tool_overrides=tool_overrides,
                         model_config_override=model_config_override,
                         image_generation_count=1,
+                        request_overrides=request_overrides,
                     )
                     processor = ImageStreamProcessor(
                         model_info.model_id,
@@ -702,6 +723,7 @@ class ImageEditService:
                         response_format=response_format,
                         tool_overrides=tool_overrides,
                         model_config_override=model_config_override,
+                        request_overrides=request_overrides,
                         return_all_images=return_all_images,
                         progress_cb=progress_cb,
                     )
@@ -733,6 +755,7 @@ class ImageEditService:
                         response_format=response_format,
                         tool_overrides=tool_overrides,
                         model_config_override=fallback_config,
+                        request_overrides=request_overrides,
                         return_all_images=return_all_images,
                         progress_cb=progress_cb,
                     )
@@ -1026,7 +1049,8 @@ class ImageEditService:
                 await self._emit_progress(
                     progress_cb, "chat_request_start", 42, "已提交编辑请求"
                 )
-                tool_overrides = {"imageGen": True}
+                tool_overrides = _build_image_edit_tool_overrides()
+                request_overrides = _build_image_edit_request_overrides()
                 model_config_override = {
                     "modelMap": {
                         "imageEditModel": "imagine",
@@ -1051,11 +1075,12 @@ class ImageEditService:
                         token=current_token,
                         message=prompt_text,
                         model=model_info.grok_model,
-                        mode=None,
+                        mode=model_info.model_mode,
                         stream=True,
                         file_attachments=file_attachments,
                         tool_overrides=tool_overrides,
                         model_config_override=model_config_override,
+                        request_overrides=request_overrides,
                     )
                     return ImageEditResult(
                         stream=True,
@@ -1073,6 +1098,7 @@ class ImageEditService:
                     tool_overrides=tool_overrides,
                     model_config_override=model_config_override,
                     file_attachments=file_attachments,
+                    request_overrides=request_overrides,
                     return_all_images=return_all_images,
                     progress_cb=progress_cb,
                 )
@@ -1144,6 +1170,7 @@ class ImageEditService:
         tool_overrides: dict,
         model_config_override: dict,
         file_attachments: List[str] | None = None,
+        request_overrides: dict | None = None,
         return_all_images: bool = False,
         progress_cb: Callable[[str, dict], Any] | None = None,
     ) -> List[str]:
@@ -1152,12 +1179,14 @@ class ImageEditService:
                 token=token,
                 message=prompt,
                 model=model_info.grok_model,
-                mode=None,
+                mode=model_info.model_mode,
                 stream=True,
                 file_attachments=file_attachments,
                 tool_overrides=tool_overrides,
                 model_config_override=model_config_override,
                 image_generation_count=1,
+                request_overrides=request_overrides
+                or _build_image_edit_request_overrides(),
             )
             processor = ImageCollectProcessor(
                 model_info.model_id,
@@ -1223,7 +1252,40 @@ class ImageStreamProcessor(BaseProcessor):
     ) -> AsyncGenerator[str, None]:
         """Process stream response."""
         final_images = []
+        seen_urls: set[str] = set()
         idle_timeout = get_config("image.stream_timeout")
+
+        async def _append_url(url: str):
+            if not url or url in seen_urls:
+                return
+            seen_urls.add(url)
+            image_id = self._extract_stream_image_id(url, len(final_images))
+            if self.response_format == "url":
+                try:
+                    processed = await self.process_url(url, "image")
+                except Exception as e:
+                    logger.warning(
+                        "Image stream URL resolve failed, fallback to raw URL: "
+                        f"error={e}"
+                    )
+                    processed = _normalize_fallback_image_url(url)
+                if processed:
+                    final_images.append({"image_id": image_id, "image_data": processed})
+                return
+            try:
+                dl_service = self._get_dl()
+                base64_data = await dl_service.parse_b64(url, self.token, "image")
+                if base64_data:
+                    if "," in base64_data:
+                        b64 = base64_data.split(",", 1)[1]
+                    else:
+                        b64 = base64_data
+                    final_images.append({"image_id": image_id, "image_data": b64})
+            except Exception as e:
+                logger.warning(
+                    f"Failed to convert image to base64, skipping image: {e}"
+                )
+                return
 
         try:
             async for line in _with_idle_timeout(response, idle_timeout, self.model):
@@ -1261,44 +1323,14 @@ class ImageStreamProcessor(BaseProcessor):
                 # modelResponse
                 if mr := resp.get("modelResponse"):
                     if urls := _collect_images(mr):
-                        for url_index, url in enumerate(urls):
-                            image_id = self._extract_stream_image_id(url, url_index)
-                            if self.response_format == "url":
-                                try:
-                                    processed = await self.process_url(url, "image")
-                                except Exception as e:
-                                    logger.warning(
-                                        "Image stream URL resolve failed, fallback to raw URL: "
-                                        f"error={e}"
-                                    )
-                                    processed = _normalize_fallback_image_url(url)
-                                if processed:
-                                    final_images.append(
-                                        {"image_id": image_id, "image_data": processed}
-                                    )
-                                continue
-                            try:
-                                dl_service = self._get_dl()
-                                base64_data = await dl_service.parse_b64(
-                                    url, self.token, "image"
-                                )
-                                if base64_data:
-                                    if "," in base64_data:
-                                        b64 = base64_data.split(",", 1)[1]
-                                    else:
-                                        b64 = base64_data
-                                    final_images.append(
-                                        {"image_id": image_id, "image_data": b64}
-                                    )
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to convert image to base64, falling back to URL: {e}"
-                                )
-                                processed = await self.process_url(url, "image")
-                                if processed:
-                                    final_images.append(
-                                        {"image_id": image_id, "image_data": processed}
-                                    )
+                        for url in urls:
+                            await _append_url(url)
+                    continue
+
+                if card := resp.get("cardAttachment"):
+                    if urls := _collect_images({"cardAttachment": card}):
+                        for url in urls:
+                            await _append_url(url)
                     continue
 
             for index, item in enumerate(final_images):
@@ -1403,9 +1435,55 @@ class ImageCollectProcessor(BaseProcessor):
 
     async def process(self, response: AsyncIterable[bytes]) -> List[str]:
         """Process and collect images."""
-        images = []
+        images: List[str] = []
+        seen_urls: set[str] = set()
         idle_timeout = get_config("image.stream_timeout")
         chat_connected_emitted = False
+
+        async def _append_image(url: str):
+            if not url or url in seen_urls:
+                return
+            seen_urls.add(url)
+            if self.response_format == "url":
+                try:
+                    processed = await self.process_url(url, "image")
+                except Exception as e:
+                    logger.warning(
+                        "Image collect URL resolve failed, fallback to raw URL: "
+                        f"error={e}"
+                    )
+                    processed = _normalize_fallback_image_url(url)
+                if processed:
+                    images.append(processed)
+                    progress = min(90, 64 + len(images) * 12)
+                    await self._emit_progress(
+                        "image_downloaded",
+                        progress,
+                        f"Downloaded image {len(images)}",
+                        count=len(images),
+                    )
+                return
+            try:
+                dl_service = self._get_dl()
+                base64_data = await dl_service.parse_b64(url, self.token, "image")
+                if base64_data:
+                    if "," in base64_data:
+                        b64 = base64_data.split(",", 1)[1]
+                    else:
+                        b64 = base64_data
+                    images.append(b64)
+                    progress = min(90, 64 + len(images) * 12)
+                    await self._emit_progress(
+                        "image_downloaded",
+                        progress,
+                        f"Downloaded image {len(images)}",
+                        count=len(images),
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to convert image to base64, skipping image: {e}"
+                )
+                return
 
         try:
             async for line in _with_idle_timeout(response, idle_timeout, self.model):
@@ -1423,63 +1501,19 @@ class ImageCollectProcessor(BaseProcessor):
                     await self._emit_progress(
                         "chat_connected",
                         60,
-                        "模型连接成功，正在生成图片",
+                        "Model connected, generating image",
                     )
 
                 if mr := resp.get("modelResponse"):
                     if urls := _collect_images(mr):
                         for url in urls:
-                            if self.response_format == "url":
-                                try:
-                                    processed = await self.process_url(url, "image")
-                                except Exception as e:
-                                    logger.warning(
-                                        "Image collect URL resolve failed, fallback to raw URL: "
-                                        f"error={e}"
-                                    )
-                                    processed = _normalize_fallback_image_url(url)
-                                if processed:
-                                    images.append(processed)
-                                    progress = min(90, 64 + len(images) * 12)
-                                    await self._emit_progress(
-                                        "image_downloaded",
-                                        progress,
-                                        f"已下载第 {len(images)} 张图片",
-                                        count=len(images),
-                                    )
-                                continue
-                            try:
-                                dl_service = self._get_dl()
-                                base64_data = await dl_service.parse_b64(
-                                    url, self.token, "image"
-                                )
-                                if base64_data:
-                                    if "," in base64_data:
-                                        b64 = base64_data.split(",", 1)[1]
-                                    else:
-                                        b64 = base64_data
-                                    images.append(b64)
-                                    progress = min(90, 64 + len(images) * 12)
-                                    await self._emit_progress(
-                                        "image_downloaded",
-                                        progress,
-                                        f"已下载第 {len(images)} 张图片",
-                                        count=len(images),
-                                    )
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to convert image to base64, falling back to URL: {e}"
-                                )
-                                processed = await self.process_url(url, "image")
-                                if processed:
-                                    images.append(processed)
-                                    progress = min(90, 64 + len(images) * 12)
-                                    await self._emit_progress(
-                                        "image_downloaded",
-                                        progress,
-                                        f"已下载第 {len(images)} 张图片",
-                                        count=len(images),
-                                    )
+                            await _append_image(url)
+                    continue
+
+                if card := resp.get("cardAttachment"):
+                    if urls := _collect_images({"cardAttachment": card}):
+                        for url in urls:
+                            await _append_image(url)
 
         except asyncio.CancelledError:
             logger.debug("Image collect cancelled by client")

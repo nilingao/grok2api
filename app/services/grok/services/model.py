@@ -212,8 +212,8 @@ class ModelService:
         ),
         ModelInfo(
             model_id="grok-imagine-1.0",
-            grok_model="grok-3",
-            model_mode="MODEL_MODE_FAST",
+            grok_model="grok-420",
+            model_mode="auto",
             tier=Tier.BASIC,
             cost=Cost.HIGH,
             display_name="Grok Image",
@@ -224,8 +224,8 @@ class ModelService:
         ),
         ModelInfo(
             model_id="grok-imagine-1.0-edit",
-            grok_model="imagine-image-edit",
-            model_mode="MODEL_MODE_FAST",
+            grok_model="grok-420",
+            model_mode="auto",
             tier=Tier.BASIC,
             cost=Cost.HIGH,
             display_name="Grok Image Edit",
