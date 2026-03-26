@@ -196,13 +196,50 @@ class MediaPost404HandlingTests(unittest.IsolatedAsyncioTestCase):
                 local_url="data:image/png;base64,abc",
             )
 
-        self.assertEqual(metadata.get("post_id"), "created-from-public-url")
-        self.assertEqual(calls["get"], [])
-        self.assertEqual(
-            calls["request"],
-            [("MEDIA_POST_TYPE_IMAGE", f"https://imagine-public.x.ai/imagine-public/images/{post_id}.jpg", "")],
-        )
-        self.assertEqual(calls["create_link"], [("created-from-public-url", "post-page", "web")])
+        self.assertEqual(metadata.get("post_id"), post_id)
+        self.assertEqual(calls["get"], [post_id])
+        self.assertEqual(calls["request"], [])
+        self.assertEqual(calls["create_link"], [])
+
+    async def test_capture_metadata_create_before_get_failure_is_not_retried(self):
+        calls = {"get": [], "request": [], "create_link": []}
+        post_id = "abc123-def456-7890-abcd-ef1234567890"
+        local_url = f"https://assets.grok.com/users/u1/generated/{post_id}/image.jpg"
+
+        async def _fake_get(_session, _token, pid):
+            calls["get"].append(pid)
+            return _FakeResponse(200, "{}")
+
+        async def _fake_request(_session, _token, media_type, media_url, prompt=""):
+            calls["request"].append((media_type, media_url, prompt))
+            raise RuntimeError("create failed once")
+
+        async def _fake_create_link(_session, _token, pid, source="post-page", platform="web"):
+            calls["create_link"].append((pid, source, platform))
+            return _FakeResponse(200, '{"shareLink":"https://grok.com/imagine/post/should-not-happen"}')
+
+        with patch(
+            "app.services.reverse.media_post.MediaPostReverse.get",
+            new=_fake_get,
+        ), patch(
+            "app.services.reverse.media_post.MediaPostReverse.request",
+            new=_fake_request,
+        ), patch(
+            "app.services.reverse.media_post.MediaPostReverse.create_link",
+            new=_fake_create_link,
+        ):
+            metadata = await MediaPostReverse.capture_metadata(
+                _FakeSession(),
+                "sso=test",
+                post_id,
+                media_type="image",
+                local_url=local_url,
+            )
+
+        self.assertEqual(metadata.get("post_id"), post_id)
+        self.assertEqual(calls["get"], [post_id])
+        self.assertEqual(len(calls["request"]), 1)
+        self.assertEqual(calls["create_link"], [])
 
     async def test_capture_metadata_normalizes_proxy_file_url_before_create(self):
         calls = {"get": [], "request": [], "create_link": []}

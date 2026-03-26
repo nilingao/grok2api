@@ -96,6 +96,22 @@ class MediaPostReverse:
         return ""
 
     @staticmethod
+    def _can_create_from_source_url(value: str) -> bool:
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return False
+        if raw.startswith("data:"):
+            return False
+        if not (raw.startswith("http://") or raw.startswith("https://")):
+            return False
+        if "assets.grok.com/" in raw:
+            return True
+        # Grok media/post/create often rejects imagine-public mirrors for metadata creation.
+        if "imagine-public.x.ai/imagine-public/" in raw:
+            return False
+        return False
+
+    @staticmethod
     async def write_metadata(post_id: str, metadata: dict[str, Any]) -> Path | None:
         post_text = str(post_id or "").strip()
         if not post_text or not isinstance(metadata, dict):
@@ -148,7 +164,10 @@ class MediaPostReverse:
         source_url_lower = source_url.lower()
         source_hint_post_id = MediaPostReverse._extract_media_source_post_id(source_url)
         post_text_lower = post_text.lower()
+        can_create_from_source = MediaPostReverse._can_create_from_source_url(source_url)
         should_create_before_get = bool(
+            can_create_from_source
+            and
             source_url
             and (
                 (source_hint_post_id and source_hint_post_id != post_text_lower)
@@ -161,13 +180,16 @@ class MediaPostReverse:
                 or f"/imagine-public/share-images/{post_text_lower}" in source_url_lower
             )
         )
+        create_attempted = False
 
-        async def _create_from_source_url() -> None:
+        async def _create_from_source_url() -> bool:
             nonlocal post_text, post_payload, post_obj
+            if not can_create_from_source:
+                return False
             if not source_url or not (
                 source_url.startswith("http://") or source_url.startswith("https://")
             ):
-                return
+                return False
             try:
                 create_resp = await MediaPostReverse.request(
                     session,
@@ -190,10 +212,11 @@ class MediaPostReverse:
                     "MediaPost metadata fallback create failed: "
                     f"source_url={source_url}, error={e}"
                 )
+            return True
 
         post_obj: dict[str, Any] = {}
         if should_create_before_get:
-            await _create_from_source_url()
+            create_attempted = await _create_from_source_url()
 
         if not post_obj:
             try:
@@ -204,7 +227,7 @@ class MediaPostReverse:
                 logger.warning(f"MediaPost metadata get failed: post_id={post_text}, error={e}")
 
         # If the probed id is not a real media post id, create one from final media URL first.
-        if not post_obj:
+        if not post_obj and not create_attempted:
             await _create_from_source_url()
 
         try:

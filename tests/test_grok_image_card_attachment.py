@@ -30,6 +30,11 @@ class _FakeDownloadService:
         return None
 
 
+class _FakeDownloadServiceWithB64(_FakeDownloadService):
+    async def parse_b64(self, *_args, **_kwargs):
+        return "data:image/png;base64,Zm9v"
+
+
 def _card_attachment_payload(
     image_url: str,
     progress: int = 100,
@@ -170,6 +175,41 @@ class ImageCardAttachmentProcessorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             completed[0].get("url"),
             "https://assets.grok.com/users/u1/generated/p1/edited.jpg",
+        )
+
+    async def test_stream_share_link_uses_source_url_instead_of_b64(self):
+        processor = ImageStreamProcessor("test-model", "sso=test", n=1, response_format="b64_json")
+        processor._dl_service = _FakeDownloadServiceWithB64()
+        captured = {}
+        image_post_id = "11111111-2222-3333-4444-555555555555"
+        image_url = f"users/u1/generated/{image_post_id}/image.jpg"
+
+        async def _fake_share_link(token, post_id, *, local_url=""):
+            captured["token"] = token
+            captured["post_id"] = post_id
+            captured["local_url"] = local_url
+
+        with patch(
+            "app.services.grok.services.image_edit._try_log_image_share_link",
+            new=_fake_share_link,
+        ):
+            chunks = []
+            async for chunk in processor.process(
+                _card_attachment_only_stream(image_url)
+            ):
+                chunks.append(chunk)
+
+        completed = [
+            _parse_sse_data(chunk)
+            for chunk in chunks
+            if "image_generation.completed" in str(chunk)
+        ]
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(captured.get("token"), "sso=test")
+        self.assertEqual(captured.get("post_id"), image_post_id)
+        self.assertEqual(
+            captured.get("local_url"),
+            f"https://assets.grok.com/users/u1/generated/{image_post_id}/image.jpg",
         )
 
 

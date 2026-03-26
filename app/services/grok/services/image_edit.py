@@ -1270,7 +1270,13 @@ class ImageStreamProcessor(BaseProcessor):
                     )
                     processed = _normalize_fallback_image_url(url)
                 if processed:
-                    final_images.append({"image_id": image_id, "image_data": processed})
+                    final_images.append(
+                        {
+                            "image_id": image_id,
+                            "image_data": processed,
+                            "source_url": processed,
+                        }
+                    )
                 return
             try:
                 dl_service = self._get_dl()
@@ -1280,7 +1286,13 @@ class ImageStreamProcessor(BaseProcessor):
                         b64 = base64_data.split(",", 1)[1]
                     else:
                         b64 = base64_data
-                    final_images.append({"image_id": image_id, "image_data": b64})
+                    final_images.append(
+                        {
+                            "image_id": image_id,
+                            "image_data": b64,
+                            "source_url": _normalize_fallback_image_url(url),
+                        }
+                    )
             except Exception as e:
                 logger.warning(
                     f"Failed to convert image to base64, skipping image: {e}"
@@ -1365,7 +1377,12 @@ class ImageStreamProcessor(BaseProcessor):
                     },
                 )
                 if image_id and self.token:
-                    await _try_log_image_share_link(self.token, image_id, local_url=b64)
+                    source_url = str(item.get("source_url") or "").strip()
+                    await _try_log_image_share_link(
+                        self.token,
+                        image_id,
+                        local_url=source_url or b64,
+                    )
         except asyncio.CancelledError:
             logger.debug("Image stream cancelled by client")
         except StreamIdleTimeoutError as e:
