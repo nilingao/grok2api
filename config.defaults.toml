@@ -99,6 +99,10 @@ limit_mb = 512
 [chat]
 # Reverse 接口并发上限
 concurrent = 50
+# 是否将 app-chat 上游关键响应写入抓包文件
+capture_enabled = true
+# app-chat 详细抓包文件路径（JSONL）
+capture_file = "logs/app_chat_capture.jsonl"
 # 连接超时时间（秒），用于弱网快速失败
 connect_timeout = 12
 # Reverse 接口超时时间（秒）
