@@ -70,6 +70,37 @@
     }
   }
 
+  function normalizeUploadErrorMessage(message) {
+    const text = String(message || '').trim();
+    if (!text) return text;
+    if (/content_moderated|content[- ]moderated|content is moderated/i.test(text)) {
+      return '图片内容触发审核限制，无法上传。请更换图片后重试。';
+    }
+    return text;
+  }
+
+  async function parseApiErrorText(res, fallbackText) {
+    const text = await res.text();
+    if (!text) return fallbackText || `请求失败：HTTP ${res.status}`;
+    try {
+      const data = JSON.parse(text);
+      if (data && typeof data === 'object') {
+        if (data.error && data.error.message) {
+          return normalizeUploadErrorMessage(String(data.error.message));
+        }
+        if (data.detail) {
+          return normalizeUploadErrorMessage(String(data.detail));
+        }
+        if (data.message) {
+          return normalizeUploadErrorMessage(String(data.message));
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+    return normalizeUploadErrorMessage(text || fallbackText);
+  }
+
   function setStatus(state, text) {
     if (!statusText) return;
     statusText.textContent = text;
@@ -533,8 +564,7 @@
       body: JSON.stringify({ prompt, aspect_ratio: ratio, nsfw: nsfwEnabled })
     });
     if (!res.ok) {
-      const text = await res.text();
-      throw new Error(text || 'Failed to create task');
+      throw new Error(await parseApiErrorText(res, 'Failed to create task'));
     }
     const data = await res.json();
     return data && data.task_id ? String(data.task_id) : '';
@@ -566,8 +596,7 @@
       }),
     });
     if (!res.ok) {
-      const text = await res.text();
-      throw new Error(text || 'edit_failed');
+      throw new Error(await parseApiErrorText(res, 'edit_failed'));
     }
     return await res.json();
   }
@@ -589,8 +618,7 @@
     });
 
     if (!res.ok) {
-      const text = await res.text();
-      throw new Error(text || 'edit_failed');
+      throw new Error(await parseApiErrorText(res, 'edit_failed'));
     }
 
     const contentType = String(res.headers.get('content-type') || '').toLowerCase();
