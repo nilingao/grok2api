@@ -144,100 +144,25 @@ class MediaPostReverse:
         post_payload = {}
         share_payload = {}
         share_link = ""
-
-        def _payload_post(data: dict[str, Any]) -> dict[str, Any]:
-            post_obj = data.get("post", {}) if isinstance(data, dict) else {}
-            return post_obj if isinstance(post_obj, dict) else {}
-
-        def _extract_post_id(data: dict[str, Any]) -> str:
-            return str(_payload_post(data).get("id") or "").strip()
-        source_url = MediaPostReverse._normalize_source_media_url(local_url)
-        if not (source_url.startswith("http://") or source_url.startswith("https://")):
-            fallback_thumbnail = MediaPostReverse._normalize_source_media_url(thumbnail_url)
-            if fallback_thumbnail.startswith("http://") or fallback_thumbnail.startswith("https://"):
-                source_url = fallback_thumbnail
-            elif (
-                MediaPostReverse._resolve_media_post_type(media_type) == "MEDIA_POST_TYPE_IMAGE"
-                and re.fullmatch(r"[0-9a-fA-F-]{32,36}", post_text)
-            ):
-                source_url = f"https://imagine-public.x.ai/imagine-public/images/{post_text}.jpg"
-        source_url_lower = source_url.lower()
-        source_hint_post_id = MediaPostReverse._extract_media_source_post_id(source_url)
-        post_text_lower = post_text.lower()
-        can_create_from_source = MediaPostReverse._can_create_from_source_url(source_url)
-        should_create_before_get = bool(
-            can_create_from_source
-            and
-            source_url
-            and (
-                (source_hint_post_id and source_hint_post_id != post_text_lower)
-                or f"/generated/{post_text_lower}" in source_url_lower
-                or (
-                    "/users/" in source_url_lower
-                    and f"/{post_text_lower}/content" in source_url_lower
-                )
-                or f"/imagine-public/images/{post_text_lower}" in source_url_lower
-                or f"/imagine-public/share-images/{post_text_lower}" in source_url_lower
-            )
-        )
-        create_attempted = False
-
-        async def _create_from_source_url() -> bool:
-            nonlocal post_text, post_payload, post_obj
-            if not can_create_from_source:
-                return False
-            if not source_url or not (
-                source_url.startswith("http://") or source_url.startswith("https://")
-            ):
-                return False
-            try:
-                create_resp = await MediaPostReverse.request(
-                    session,
-                    token,
-                    MediaPostReverse._resolve_media_post_type(media_type),
-                    source_url,
-                )
-                created_payload = create_resp.json() if create_resp is not None else {}
-                created_post_id = _extract_post_id(created_payload)
-                if created_post_id:
-                    post_text = created_post_id
-                    post_payload = created_payload
-                    post_obj = _payload_post(created_payload)
-                    logger.info(
-                        "MediaPost metadata fallback create succeeded: "
-                        f"source_url={source_url}, created_post_id={created_post_id}"
-                    )
-            except Exception as e:
-                logger.warning(
-                    "MediaPost metadata fallback create failed: "
-                    f"source_url={source_url}, error={e}"
-                )
-            return True
-
-        post_obj: dict[str, Any] = {}
-        if should_create_before_get:
-            create_attempted = await _create_from_source_url()
-
-        if not post_obj:
-            try:
-                post_resp = await MediaPostReverse.get(session, token, post_text)
-                post_payload = post_resp.json() if post_resp is not None else {}
-                post_obj = _payload_post(post_payload)
-            except Exception as e:
-                logger.warning(f"MediaPost metadata get failed: post_id={post_text}, error={e}")
-
-        # If the probed id is not a real media post id, create one from final media URL first.
-        if not post_obj and not create_attempted:
-            await _create_from_source_url()
-
+        create_public_share_link = bool(get_config("asset.create_public_share_link", True))
         try:
-            if post_obj:
+            post_resp = await MediaPostReverse.get(session, token, post_text)
+            post_payload = post_resp.json() if post_resp is not None else {}
+        except Exception as e:
+            logger.warning(f"MediaPost metadata get failed: post_id={post_text}, error={e}")
+        if create_public_share_link:
+            try:
                 share_resp = await MediaPostReverse.create_link(session, token, post_text)
                 share_payload = share_resp.json() if share_resp is not None else {}
                 if isinstance(share_payload, dict):
                     share_link = str(share_payload.get("shareLink") or "").strip()
-        except Exception as e:
-            logger.warning(f"MediaPost metadata create-link failed: post_id={post_text}, error={e}")
+            except Exception as e:
+                logger.warning(f"MediaPost metadata create-link failed: post_id={post_text}, error={e}")
+        else:
+            logger.info(
+                "MediaPost metadata create-link skipped by config: post_id={}",
+                post_text,
+            )
 
         canonical_post_id = post_text
         if share_link:

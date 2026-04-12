@@ -1217,6 +1217,7 @@ class ImageEditService:
                 token,
                 response_format=response_format,
                 progress_cb=progress_cb,
+                max_images=None if return_all_images else 1,
             )
             return await processor.process(response)
 
@@ -1234,9 +1235,7 @@ class ImageEditService:
                     share_items.append((post_id, image_url))
             for post_id, image_url in share_items:
                 await _try_log_image_share_link(token, post_id, local_url=image_url)
-        if return_all_images:
-            return all_images
-        return [all_images[0]]
+        return all_images
 
 
 class ImageStreamProcessor(BaseProcessor):
@@ -1452,12 +1451,14 @@ class ImageCollectProcessor(BaseProcessor):
         token: str = "",
         response_format: str = "b64_json",
         progress_cb: Callable[[str, dict], Any] | None = None,
+        max_images: int | None = None,
     ):
         if response_format == "base64":
             response_format = "b64_json"
         super().__init__(model, token)
         self.response_format = response_format
         self.progress_cb = progress_cb
+        self.max_images = max_images if isinstance(max_images, int) and max_images > 0 else None
 
     async def _emit_progress(
         self, event: str, progress: int, message: str, **extra: Any
@@ -1481,51 +1482,6 @@ class ImageCollectProcessor(BaseProcessor):
         idle_timeout = get_config("image.stream_timeout")
         chat_connected_emitted = False
 
-        async def _append_image(url: str):
-            if not url or url in seen_urls:
-                return
-            seen_urls.add(url)
-            if self.response_format == "url":
-                try:
-                    processed = await self.process_url(url, "image")
-                except Exception as e:
-                    logger.warning(
-                        "Image collect URL resolve failed, fallback to raw URL: "
-                        f"error={e}"
-                    )
-                    processed = _normalize_fallback_image_url(url)
-                if processed:
-                    images.append(processed)
-                    progress = min(90, 64 + len(images) * 12)
-                    await self._emit_progress(
-                        "image_downloaded",
-                        progress,
-                        f"Downloaded image {len(images)}",
-                        count=len(images),
-                    )
-                return
-            try:
-                dl_service = self._get_dl()
-                base64_data = await dl_service.parse_b64(url, self.token, "image")
-                if base64_data:
-                    if "," in base64_data:
-                        b64 = base64_data.split(",", 1)[1]
-                    else:
-                        b64 = base64_data
-                    images.append(b64)
-                    progress = min(90, 64 + len(images) * 12)
-                    await self._emit_progress(
-                        "image_downloaded",
-                        progress,
-                        f"Downloaded image {len(images)}",
-                        count=len(images),
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to convert image to base64, skipping image: {e}"
-                )
-                return
-
         try:
             async for line in _with_idle_timeout(response, idle_timeout, self.model):
                 line = _normalize_line(line)
@@ -1542,19 +1498,69 @@ class ImageCollectProcessor(BaseProcessor):
                     await self._emit_progress(
                         "chat_connected",
                         60,
-                        "Model connected, generating image",
+                        "模型连接成功，正在生成图片",
                     )
 
                 if mr := resp.get("modelResponse"):
                     if urls := _collect_images(mr):
                         for url in urls:
-                            await _append_image(url)
-                    continue
-
-                if card := resp.get("cardAttachment"):
-                    if urls := _collect_images({"cardAttachment": card}):
-                        for url in urls:
-                            await _append_image(url)
+                            if self.response_format == "url":
+                                try:
+                                    processed = await self.process_url(url, "image")
+                                except Exception as e:
+                                    logger.warning(
+                                        "Image collect URL resolve failed, fallback to raw URL: "
+                                        f"error={e}"
+                                    )
+                                    processed = _normalize_fallback_image_url(url)
+                                if processed:
+                                    images.append(processed)
+                                    progress = min(90, 64 + len(images) * 12)
+                                    await self._emit_progress(
+                                        "image_downloaded",
+                                        progress,
+                                        f"已下载第 {len(images)} 张图片",
+                                        count=len(images),
+                                    )
+                                    if self.max_images and len(images) >= self.max_images:
+                                        return images
+                                continue
+                            try:
+                                dl_service = self._get_dl()
+                                base64_data = await dl_service.parse_b64(
+                                    url, self.token, "image"
+                                )
+                                if base64_data:
+                                    if "," in base64_data:
+                                        b64 = base64_data.split(",", 1)[1]
+                                    else:
+                                        b64 = base64_data
+                                    images.append(b64)
+                                    progress = min(90, 64 + len(images) * 12)
+                                    await self._emit_progress(
+                                        "image_downloaded",
+                                        progress,
+                                        f"已下载第 {len(images)} 张图片",
+                                        count=len(images),
+                                    )
+                                    if self.max_images and len(images) >= self.max_images:
+                                        return images
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to convert image to base64, falling back to URL: {e}"
+                                )
+                                processed = await self.process_url(url, "image")
+                                if processed:
+                                    images.append(processed)
+                                    progress = min(90, 64 + len(images) * 12)
+                                    await self._emit_progress(
+                                        "image_downloaded",
+                                        progress,
+                                        f"已下载第 {len(images)} 张图片",
+                                        count=len(images),
+                                    )
+                                    if self.max_images and len(images) >= self.max_images:
+                                        return images
 
         except asyncio.CancelledError:
             logger.debug("Image collect cancelled by client")
