@@ -91,7 +91,7 @@ reload_interval_sec = 30
 [model_routing]
 # 模型到 Token 池的手动路由配置。
 # 值支持字符串（单池）或字符串数组（按顺序回退）。
-# 例如：{ "grok-4.20-expert" = "ssoSuper", "grok-4.20-auto" = ["ssoBasic", "ssoSuper"] }
+# 例如：{ "grok-4.20-expert" = "ssoSuper", "grok-4.20-auto" = ["ssoBasic", "ssoSuper"], "grok-4.3-beta" = "ssoSuper" }
 model_pools = {}
 
 # ==================== 缓存管理 ====================

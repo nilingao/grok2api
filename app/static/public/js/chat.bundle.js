@@ -6016,7 +6016,7 @@ ${renderedAnswer}`.trim();
     }
     async function loadModels() {
       if (!modelSelect) return;
-      const fallback = ["grok-4.1-fast", "grok-4", "grok-3", "grok-3-mini", "grok-3-thinking", "grok-4.20-fast", "grok-4.20-expert", "grok-4.20-auto"];
+      const fallback = ["grok-4.1-fast", "grok-4", "grok-3", "grok-3-mini", "grok-3-thinking", "grok-4.20-fast", "grok-4.20-expert", "grok-4.20-auto", "grok-4.3-beta"];
       const preferred = "grok-4.20-auto";
       let list = fallback;
       try {

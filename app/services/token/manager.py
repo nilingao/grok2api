@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 from app.core.logger import logger
+from curl_cffi.requests import AsyncSession
 from app.services.token.models import (
     TokenInfo,
     EffortType,
@@ -13,12 +14,14 @@ from app.services.token.models import (
     TokenStatus,
     BASIC__DEFAULT_QUOTA,
     SUPER_DEFAULT_QUOTA,
+    default_quota_set,
 )
 from app.core.storage import get_storage, LocalStorage
 from app.core.config import get_config
 from app.core.exceptions import UpstreamException
 from app.services.token.pool import TokenPool
 from app.services.grok.batch_services.usage import UsageService
+from app.services.reverse.rate_limits import fetch_quota_windows
 
 
 DEFAULT_REFRESH_BATCH_SIZE = 10
@@ -30,12 +33,28 @@ DEFAULT_SAVE_DELAY_MS = 500
 
 SUPER_POOL_NAME = "ssoSuper"
 BASIC_POOL_NAME = "ssoBasic"
+HEAVY_POOL_NAME = "ssoHeavy"
+
+POOL_MODE_KEYS = {
+    BASIC_POOL_NAME: ("auto", "fast", "expert"),
+    SUPER_POOL_NAME: ("auto", "fast", "expert", "grok_4_3"),
+    HEAVY_POOL_NAME: ("auto", "fast", "expert", "heavy", "grok_4_3"),
+}
 
 
 def _default_quota_for_pool(pool_name: str) -> int:
     if pool_name == SUPER_POOL_NAME:
         return SUPER_DEFAULT_QUOTA
     return BASIC__DEFAULT_QUOTA
+
+
+def _default_quota_set_for_pool(pool_name: str):
+    quota = _default_quota_for_pool(pool_name)
+    return default_quota_set(
+        quota,
+        heavy_supported=pool_name == HEAVY_POOL_NAME,
+        grok_4_3_supported=pool_name in {SUPER_POOL_NAME, HEAVY_POOL_NAME},
+    )
 
 
 def _token_tag(token: str) -> str:
@@ -108,8 +127,8 @@ class TokenManager:
                                 ):
                                     token_data["token"] = raw_token[4:]
                             token_info = TokenInfo(**token_data)
-                            if quota_missing and pool_name == SUPER_POOL_NAME:
-                                token_info.quota = SUPER_DEFAULT_QUOTA
+                            if quota_missing:
+                                token_info.quota = _default_quota_set_for_pool(pool_name)
                             pool.add(token_info)
                         except Exception as e:
                             logger.warning(
@@ -392,7 +411,7 @@ class TokenManager:
                     new_quota = result.get("remainingQueries")
                 if new_quota is None:
                     return False
-                old_quota = target_token.quota
+                old_quota = target_token.primary_quota()
 
                 target_token.update_quota(new_quota)
                 target_token.record_success(is_usage=is_usage)
@@ -426,6 +445,67 @@ class TokenManager:
         else:
             logger.debug(
                 f"Token {raw_token[:10]}...: sync failed, skipping local consumption"
+            )
+            return False
+
+    async def sync_usage_windows(
+        self,
+        token_str: str,
+        *,
+        is_usage: bool = False,
+    ) -> bool:
+        """按模型维度同步额度窗口。"""
+        raw_token = token_str.replace("sso=", "")
+        target_token: Optional[TokenInfo] = None
+        target_pool_name: Optional[str] = None
+        for pool_name, pool in self.pools.items():
+            target_token = pool.get(raw_token)
+            if target_token:
+                target_pool_name = pool_name
+                break
+
+        if not target_token or not target_pool_name:
+            logger.warning(f"Token {raw_token[:10]}...: not found for usage window sync")
+            return False
+
+        mode_keys = POOL_MODE_KEYS.get(target_pool_name, POOL_MODE_KEYS[BASIC_POOL_NAME])
+        try:
+            async with AsyncSession() as session:
+                windows = await fetch_quota_windows(
+                    session,
+                    token_str,
+                    mode_keys=mode_keys,
+                )
+            if not windows:
+                return False
+
+            old_primary = target_token.primary_quota()
+            sync_time = int(datetime.now().timestamp() * 1000)
+            for mode_key, window in windows.items():
+                target_token.update_quota(
+                    int(window.get("remaining", 0)),
+                    mode=mode_key,
+                    total=int(window.get("total", 0)),
+                    window_seconds=window.get("window_seconds"),
+                    synced_at=sync_time,
+                    source="real",
+                )
+            target_token.mark_synced()
+            target_token.record_success(is_usage=is_usage)
+            logger.info(
+                f"Token {raw_token[:10]}...: synced quota windows "
+                f"{old_primary} -> {target_token.primary_quota()} "
+                f"(auto={target_token.quota_set().auto.remaining}, "
+                f"fast={target_token.quota_set().fast.remaining}, "
+                f"expert={target_token.quota_set().expert.remaining}, "
+                f"heavy={(target_token.quota_set().heavy.remaining if target_token.quota_set().heavy else 0)}, "
+                f"grok_4_3={(target_token.quota_set().grok_4_3.remaining if target_token.quota_set().grok_4_3 else 0)})"
+            )
+            self._schedule_save()
+            return True
+        except Exception as e:
+            logger.warning(
+                f"Token {raw_token[:10]}...: usage window sync failed ({e})"
             )
             return False
 
@@ -490,8 +570,8 @@ class TokenManager:
         for pool in self.pools.values():
             token = pool.get(raw_token)
             if token:
-                old_quota = token.quota
-                token.quota = 0
+                old_quota = token.primary_quota()
+                token.update_quota(0)
                 token.status = TokenStatus.COOLING
                 logger.warning(
                     f"Token {raw_token[:10]}...: marked as rate limited "
@@ -712,31 +792,38 @@ class TokenManager:
                 # 重试逻辑：最多 2 次重试
                 for retry in range(3):  # 0, 1, 2
                     try:
-                        result = await usage_service.get(token_str)
+                        old_quota = token_info.primary_quota()
+                        old_status = token_info.status
+                        synced = await self.sync_usage_windows(token_str, is_usage=False)
+                        if not synced:
+                            result = await usage_service.get(token_str)
+                            if result and "remainingTokens" in result:
+                                new_quota = result.get("remainingTokens")
+                                if new_quota is None:
+                                    new_quota = result.get("remainingQueries")
+                                if new_quota is None:
+                                    return {"recovered": False, "expired": False}
+                                token_info.update_quota(new_quota)
+                                token_info.mark_synced()
+                                logger.info(
+                                    f"Token {token_info.token[:10]}...: refreshed "
+                                    f"{old_quota} -> {new_quota}, status: {old_status} -> {token_info.status}"
+                                )
+                                return {
+                                    "recovered": new_quota > 0 and old_quota == 0,
+                                    "expired": False,
+                                }
+                            return {"recovered": False, "expired": False}
 
-                        if result and "remainingTokens" in result:
-                            new_quota = result.get("remainingTokens")
-                            if new_quota is None:
-                                new_quota = result.get("remainingQueries")
-                            if new_quota is None:
-                                return {"recovered": False, "expired": False}
-                            old_quota = token_info.quota
-                            old_status = token_info.status
-
-                            token_info.update_quota(new_quota)
-                            token_info.mark_synced()
-
-                            logger.info(
-                                f"Token {token_info.token[:10]}...: refreshed "
-                                f"{old_quota} -> {new_quota}, status: {old_status} -> {token_info.status}"
-                            )
-
-                            return {
-                                "recovered": new_quota > 0 and old_quota == 0,
-                                "expired": False,
-                            }
-
-                        return {"recovered": False, "expired": False}
+                        new_quota = token_info.primary_quota()
+                        logger.info(
+                            f"Token {token_info.token[:10]}...: refreshed "
+                            f"{old_quota} -> {new_quota}, status: {old_status} -> {token_info.status}"
+                        )
+                        return {
+                            "recovered": new_quota > 0 and old_quota == 0,
+                            "expired": False,
+                        }
 
                     except Exception as e:
                         error_str = str(e)

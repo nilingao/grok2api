@@ -17,9 +17,71 @@ const byId = (id) => document.getElementById(id);
 const qsa = (selector) => document.querySelectorAll(selector);
 const DEFAULT_QUOTA_BASIC = 80;
 const DEFAULT_QUOTA_SUPER = 140;
+const QUOTA_MODES = ['auto', 'fast', 'expert', 'heavy', 'grok_4_3'];
 
 function getDefaultQuotaForPool(pool) {
   return pool === 'ssoSuper' ? DEFAULT_QUOTA_SUPER : DEFAULT_QUOTA_BASIC;
+}
+
+function buildDefaultQuotaSet(pool, quota = null) {
+  const remaining = Number.isFinite(Number(quota)) ? Number(quota) : getDefaultQuotaForPool(pool);
+  const base = {
+    auto: { remaining, total: remaining },
+    fast: { remaining, total: remaining },
+    expert: { remaining, total: remaining }
+  };
+  if (pool === 'ssoSuper' || pool === 'ssoHeavy') {
+    base.grok_4_3 = { remaining, total: remaining };
+  }
+  if (pool === 'ssoHeavy') {
+    base.heavy = { remaining: 20, total: 20 };
+  }
+  return base;
+}
+
+function normalizeQuota(quota, pool) {
+  if (quota && typeof quota === 'object' && !Array.isArray(quota)) {
+    if (QUOTA_MODES.some(mode => Object.prototype.hasOwnProperty.call(quota, mode))) {
+      const normalized = {};
+      QUOTA_MODES.forEach(mode => {
+        if (quota[mode] && typeof quota[mode] === 'object') {
+          normalized[mode] = {
+            remaining: Number(quota[mode].remaining || 0),
+            total: Number(quota[mode].total ?? quota[mode].remaining ?? 0),
+            window_seconds: quota[mode].window_seconds ?? null,
+            reset_at: quota[mode].reset_at ?? null,
+            synced_at: quota[mode].synced_at ?? null,
+            source: quota[mode].source ?? null,
+          };
+        }
+      });
+      return { ...buildDefaultQuotaSet(pool, 0), ...normalized };
+    }
+    if (Object.prototype.hasOwnProperty.call(quota, 'remaining') || Object.prototype.hasOwnProperty.call(quota, 'total')) {
+      return buildDefaultQuotaSet(pool, Number(quota.remaining ?? quota.total ?? 0));
+    }
+  }
+  return buildDefaultQuotaSet(pool, Number(quota || 0));
+}
+
+function quotaRemaining(quota, mode = 'auto') {
+  return Number(quota?.[mode]?.remaining || 0);
+}
+
+function primaryQuota(quota) {
+  return quotaRemaining(quota, 'auto');
+}
+
+function renderQuotaPills(quota) {
+  const pills = [
+    ['A', quotaRemaining(quota, 'auto'), 'badge-blue'],
+    ['F', quotaRemaining(quota, 'fast'), 'badge-green'],
+    ['E', quotaRemaining(quota, 'expert'), 'badge-purple'],
+    ['H', quotaRemaining(quota, 'heavy'), 'badge-orange'],
+  ];
+  return pills
+    .map(([label, value, cls]) => `<span class="badge ${value > 0 ? cls : 'badge-gray'}">${label}:${value}</span>`)
+    .join(' ');
 }
 
 function setText(id, text) {
@@ -144,11 +206,11 @@ function processTokens(data) {
       tokens.forEach(t => {
         // Normalize
         const tObj = typeof t === 'string'
-          ? { token: t, status: 'active', quota: 0, note: '', use_count: 0, tags: [] }
+          ? { token: t, status: 'active', quota: buildDefaultQuotaSet(pool, 0), note: '', use_count: 0, tags: [] }
           : {
             token: t.token,
             status: t.status || 'active',
-            quota: t.quota || 0,
+            quota: normalizeQuota(t.quota, pool),
             note: t.note || '',
             fail_count: t.fail_count || 0,
             use_count: t.use_count || 0,
@@ -172,20 +234,29 @@ function updateStats(data) {
   let activeTokens = 0;
   let coolingTokens = 0;
   let invalidTokens = 0;
+  let disabledTokens = 0;
   let nsfwTokens = 0;
   let noNsfwTokens = 0;
-  let chatQuota = 0;
+  let autoQuota = 0;
+  let fastQuota = 0;
+  let expertQuota = 0;
+  let heavyQuota = 0;
   let totalCalls = 0;
 
   flatTokens.forEach(t => {
     if (t.status === 'active') {
       activeTokens++;
-      chatQuota += t.quota;
     } else if (t.status === 'cooling') {
       coolingTokens++;
+    } else if (t.status === 'disabled') {
+      disabledTokens++;
     } else {
       invalidTokens++;
     }
+    autoQuota += quotaRemaining(t.quota, 'auto');
+    fastQuota += quotaRemaining(t.quota, 'fast');
+    expertQuota += quotaRemaining(t.quota, 'expert');
+    heavyQuota += quotaRemaining(t.quota, 'heavy');
     if (t.tags && t.tags.includes('nsfw')) {
       nsfwTokens++;
     } else {
@@ -194,16 +265,17 @@ function updateStats(data) {
     totalCalls += Number(t.use_count || 0);
   });
 
-  const imageQuota = Math.floor(chatQuota / 2);
-
   setText('stat-total', totalTokens.toLocaleString());
   setText('stat-active', activeTokens.toLocaleString());
   setText('stat-cooling', coolingTokens.toLocaleString());
   setText('stat-invalid', invalidTokens.toLocaleString());
+  setText('stat-disabled', disabledTokens.toLocaleString());
 
-  setText('stat-chat-quota', chatQuota.toLocaleString());
-  setText('stat-image-quota', imageQuota.toLocaleString());
+  setText('stat-chat-quota', autoQuota.toLocaleString());
+  setText('stat-image-quota', fastQuota.toLocaleString());
+  setText('stat-video-quota', expertQuota.toLocaleString());
   setText('stat-total-calls', totalCalls.toLocaleString());
+  setText('stat-heavy-quota', heavyQuota.toLocaleString());
 
   updateTabCounts({
     all: totalTokens,
@@ -213,6 +285,26 @@ function updateStats(data) {
     nsfw: nsfwTokens,
     'no-nsfw': noNsfwTokens
   });
+}
+
+function setLocalNsfwState(tokens, enabled) {
+  const tokenSet = new Set((tokens || []).filter(Boolean));
+  if (!tokenSet.size) return;
+  flatTokens.forEach(item => {
+    if (!tokenSet.has(item.token)) return;
+    if (!Array.isArray(item.tags)) item.tags = [];
+    const hasNsfw = item.tags.includes('nsfw');
+    if (enabled && !hasNsfw) {
+      item.tags.push('nsfw');
+    } else if (!enabled && hasNsfw) {
+      item.tags = item.tags.filter(tag => tag !== 'nsfw');
+    }
+  });
+}
+
+function refreshTokenView() {
+  updateStats();
+  renderTable();
 }
 
 function renderTable() {
@@ -290,7 +382,7 @@ function renderTable() {
     // Quota (Center)
     const tdQuota = document.createElement('td');
     tdQuota.className = 'text-center font-mono text-xs';
-    tdQuota.innerText = item.quota;
+    tdQuota.innerHTML = `<div class="flex flex-wrap items-center justify-center gap-1">${renderQuotaPills(item.quota)}</div>`;
 
     // Note (Left)
     const tdNote = document.createElement('td');
@@ -304,6 +396,9 @@ function renderTable() {
                 <div class="flex items-center justify-center gap-2">
                      <button onclick="refreshStatus('${item.token}')" class="p-1 text-gray-400 hover:text-black rounded" title="刷新状态">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+                     </button>
+                     <button onclick="setTokenNsfwEnabled('${item.token}', ${!(item.tags && item.tags.includes('nsfw'))})" class="p-1 text-gray-400 hover:text-purple-600 rounded" title="${item.tags && item.tags.includes('nsfw') ? '关闭 NSFW' : '开启 NSFW'}">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"></circle><path d="M8 12h8"></path>${item.tags && item.tags.includes('nsfw') ? '' : '<path d="M12 8v8"></path>'}</svg>
                      </button>
                      <button onclick="openEditModal(${originalIndex})" class="p-1 text-gray-400 hover:text-black rounded" title="编辑">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
@@ -424,7 +519,7 @@ function openEditModal(index) {
     byId('edit-original-token').value = item.token;
     byId('edit-original-pool').value = item.pool;
     byId('edit-pool').value = item.pool;
-    byId('edit-quota').value = item.quota;
+    byId('edit-quota').value = primaryQuota(item.quota);
     byId('edit-note').value = item.note;
     document.querySelector('#edit-modal h3').innerText = '编辑 Token';
   } else {
@@ -481,7 +576,7 @@ async function saveEdit() {
 
     // Update flatTokens first to reflect UI
     item.pool = newPool || 'ssoBasic';
-    item.quota = newQuota;
+    item.quota = buildDefaultQuotaSet(newPool || item.pool || 'ssoBasic', newQuota);
     item.note = newNote;
   } else {
     // Creating new
@@ -496,7 +591,7 @@ async function saveEdit() {
     flatTokens.push({
       token: token,
       pool: newPool || 'ssoBasic',
-      quota: newQuota,
+      quota: buildDefaultQuotaSet(newPool || 'ssoBasic', newQuota),
       note: newNote,
       status: 'active', // default
       use_count: 0,
@@ -530,7 +625,7 @@ async function syncToServer() {
     const payload = {
       token: t.token,
       status: t.status,
-      quota: t.quota,
+      quota: normalizeQuota(t.quota, t.pool),
       note: t.note,
       fail_count: t.fail_count,
       use_count: t.use_count || 0,
@@ -585,7 +680,7 @@ async function submitImport() {
         token: t,
         pool: pool,
         status: 'active',
-        quota: defaultQuota,
+        quota: buildDefaultQuotaSet(pool, defaultQuota),
         note: '',
         tags: [],
         fail_count: 0,
@@ -1129,9 +1224,10 @@ async function batchEnableNSFW() {
     showToast('未选择 Token', 'error');
     return;
   }
-  const msg = `是否为选中的 ${targetCount} 个 Token 开启 NSFW 模式？`;
+  const shouldEnable = selected.some(t => !(t.tags && t.tags.includes('nsfw')));
+  const msg = `是否${shouldEnable ? '开启' : '关闭'}选中的 ${targetCount} 个 Token 的 NSFW 模式？`;
 
-  const ok = await confirmAction(msg, { okText: '开启 NSFW' });
+  const ok = await confirmAction(msg, { okText: shouldEnable ? '开启 NSFW' : '关闭 NSFW' });
   if (!ok) return;
 
   // 禁用按钮
@@ -1153,7 +1249,7 @@ async function batchEnableNSFW() {
         'Content-Type': 'application/json',
         ...buildAuthHeaders(apiKey)
       },
-      body: JSON.stringify({ tokens })
+      body: JSON.stringify({ tokens, enabled: shouldEnable })
     });
 
     const data = await readJsonResponse(res);
@@ -1180,13 +1276,15 @@ async function batchEnableNSFW() {
           if (typeof msg.total === 'number') batchTotal = msg.total;
           batchProcessed = batchTotal;
           updateBatchProgress();
+          setLocalNsfwState(tokens, shouldEnable);
           finishBatchProcess(false, { silent: true });
           const summary = msg.result && msg.result.summary ? msg.result.summary : null;
           const okCount = summary ? summary.ok : 0;
           const failCount = summary ? summary.fail : 0;
-          let text = `NSFW 开启完成：成功 ${okCount}，失败 ${failCount}`;
+          let text = `NSFW ${shouldEnable ? '切换' : '关闭'}完成：成功 ${okCount}，失败 ${failCount}`;
           if (msg.warning) text += `\n⚠️ ${msg.warning}`;
           showToast(text, failCount > 0 || msg.warning ? 'warning' : 'success');
+          refreshTokenView();
           currentBatchTaskId = null;
           BatchSSE.close(batchEventSource);
           batchEventSource = null;
@@ -1225,6 +1323,32 @@ async function batchEnableNSFW() {
     showToast('请求错误: ' + e.message, 'error');
     if (btn) btn.disabled = false;
     setActionButtonsState();
+  }
+}
+
+async function setTokenNsfwEnabled(token, enabled) {
+  const target = flatTokens.find(item => item.token === token);
+  const previousTags = target && Array.isArray(target.tags) ? [...target.tags] : [];
+  try {
+    setLocalNsfwState([token], enabled);
+    refreshTokenView();
+    const res = await fetch('/v1/admin/tokens/nsfw/enable', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...buildAuthHeaders(apiKey)
+      },
+      body: JSON.stringify({ token, enabled })
+    });
+    const data = await readJsonResponse(res);
+    if (!res.ok || !data || data.status !== 'success') {
+      throw new Error((data && (data.detail || data.message)) || `HTTP ${res.status}`);
+    }
+    showToast(enabled ? 'NSFW 已开启' : 'NSFW 已关闭', 'success');
+  } catch (e) {
+    if (target) target.tags = previousTags;
+    refreshTokenView();
+    showToast(`NSFW 操作失败: ${e.message}`, 'error');
   }
 }
 

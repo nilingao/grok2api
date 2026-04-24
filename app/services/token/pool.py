@@ -40,7 +40,7 @@ class TokenPool:
         available = [
             t
             for t in self._tokens.values()
-            if t.status == TokenStatus.ACTIVE and t.quota > 0
+            if t.status == TokenStatus.ACTIVE and t.primary_quota() > 0
             and (not exclude or t.token not in exclude)
         ]
 
@@ -48,10 +48,10 @@ class TokenPool:
             return None
 
         # 找到最大额度
-        max_quota = max(t.quota for t in available)
+        max_quota = max(t.primary_quota() for t in available)
 
         # 筛选最大额度
-        candidates = [t for t in available if t.quota == max_quota]
+        candidates = [t for t in available if t.primary_quota() == max_quota]
 
         # 随机选择
         return random.choice(candidates)
@@ -69,7 +69,7 @@ class TokenPool:
         stats = TokenPoolStats(total=len(self._tokens))
 
         for token in self._tokens.values():
-            stats.total_quota += token.quota
+            stats.total_quota += token.primary_quota()
 
             if token.status == TokenStatus.ACTIVE:
                 stats.active += 1
