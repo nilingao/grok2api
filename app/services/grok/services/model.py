@@ -339,5 +339,44 @@ class ModelService:
             return configured
         return cls._default_pool_candidates(model_id)
 
+    @classmethod
+    def quota_mode_for_model(cls, model_id: str) -> str:
+        """返回模型对应的额度窗口键。"""
+        model = cls.get(model_id)
+        if not model:
+            return "auto"
+
+        if model.model_id == "grok-4.3-beta":
+            return "grok_4_3"
+
+        if model.model_id in {
+            "grok-4.20-fast",
+            "grok-4.1-fast",
+            "grok-imagine-1.0",
+            "grok-imagine-1.0-edit",
+            "grok-imagine-1.0-video",
+        }:
+            return "fast"
+
+        if model.model_id in {
+            "grok-4.20-expert",
+            "grok-4.1-expert",
+        }:
+            return "expert"
+
+        if model.model_id == "grok-4-heavy":
+            return "heavy"
+
+        mode = str(model.model_mode or "").strip().lower()
+        if mode == "fast" or mode == "model_mode_fast":
+            return "fast"
+        if mode == "expert" or mode == "model_mode_expert":
+            return "expert"
+        if mode == "model_mode_heavy":
+            return "heavy"
+        if mode == "grok-420-computer-use-sa":
+            return "grok_4_3"
+        return "auto"
+
 
 __all__ = ["ModelService"]

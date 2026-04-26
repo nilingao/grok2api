@@ -141,6 +141,7 @@ const LOCALE_MAP = {
     "auto_refresh": { title: "自动刷新", desc: "是否开启 Token 自动刷新机制。" },
     "refresh_interval_hours": { title: "刷新间隔", desc: "普通 Token 刷新的时间间隔（小时）。" },
     "super_refresh_interval_hours": { title: "Super 刷新间隔", desc: "Super Token 刷新的时间间隔（小时）。" },
+    "refresh_unavailable_once": { title: "无可用 Token 时强刷一次", desc: "开启后，当请求首次检测到没有可用 Token 时，会对候选池中的异常 Token 强制刷新一次额度，然后立即再重试一次。" },
     "fail_threshold": { title: "失败阈值", desc: "单个 Token 连续失败多少次后被标记为不可用。" },
     "save_delay_ms": { title: "保存延迟", desc: "Token 变更合并写入的延迟（毫秒）。" },
     "reload_interval_sec": { title: "同步间隔", desc: "多 worker 场景下 Token 状态刷新间隔（秒）。" }

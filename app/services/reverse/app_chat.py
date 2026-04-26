@@ -12,6 +12,8 @@ from app.core.logger import logger
 from app.core.config import get_config
 from app.core.exceptions import UpstreamException
 from app.services.token.service import TokenService
+from app.services.grok.services.model import ModelService
+from app.services.reverse.rate_limits import MODE_NAME_BY_KEY, RateLimitsReverse
 from app.services.reverse.utils.headers import build_headers
 from app.services.reverse.utils.retry import retry_on_status
 
@@ -34,6 +36,62 @@ def _is_transient_network_error(err: Exception) -> bool:
         "timed out",
     )
     return any(k in s for k in keywords)
+
+
+def _extract_error_payload(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    try:
+        payload = orjson.loads(raw)
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+async def _diagnose_chat_429(
+    session: AsyncSession,
+    token: str,
+    requested_model: str | None,
+) -> dict[str, Any]:
+    model_id = str(requested_model or "").strip()
+    quota_mode = ModelService.quota_mode_for_model(model_id) if model_id else "auto"
+    rate_limit_model = MODE_NAME_BY_KEY.get(quota_mode)
+    if not rate_limit_model:
+        return {"quota_mode": quota_mode}
+
+    try:
+        response = await RateLimitsReverse.request(
+            session,
+            token,
+            model_name=rate_limit_model,
+        )
+        payload = response.json() if response is not None else {}
+        if not isinstance(payload, dict):
+            payload = {}
+        remaining = payload.get("remainingTokens")
+        if remaining is None:
+            remaining = payload.get("remainingQueries")
+        total = payload.get("totalTokens")
+        if total is None:
+            total = payload.get("totalQueries")
+        details = {
+            "quota_mode": quota_mode,
+            "rate_limit_model": rate_limit_model,
+            "quota_remaining": int(remaining or 0),
+            "quota_total": int(total if total is not None else remaining or 0),
+            "quota_window_seconds": payload.get("windowSizeSeconds"),
+            "quota_wait_seconds": payload.get("waitTimeSeconds"),
+        }
+        if int(remaining or 0) <= 0:
+            details["error_code"] = "quota_exhausted"
+        return details
+    except Exception as e:
+        logger.warning(
+            "AppChat 429 diagnose failed: "
+            f"requested_model={requested_model or '-'}, error={e}"
+        )
+        return {"quota_mode": quota_mode}
 
 
 class AppChatReverse:
@@ -260,9 +318,29 @@ class AppChatReverse:
                     )
                     logger.error(f"Response Headers: {response.headers}")
                     logger.error(f"Response Body: {content}")
+                    details = {"status": response.status_code, "body": content}
+                    payload_data = _extract_error_payload(content)
+                    if payload_data:
+                        details["payload"] = payload_data
+                        if isinstance(payload_data.get("error"), dict):
+                            error_obj = payload_data.get("error") or {}
+                            error_code = str(error_obj.get("code") or "").strip()
+                            error_message = str(error_obj.get("message") or "").strip()
+                            if error_code:
+                                details["error_code"] = error_code
+                            if error_message:
+                                details["error_message"] = error_message
+                    if response.status_code == 429:
+                        details.update(
+                            await _diagnose_chat_429(
+                                session,
+                                token,
+                                requested_model or model,
+                            )
+                        )
                     raise UpstreamException(
                         message=f"AppChatReverse: Chat failed, {response.status_code}",
-                        details={"status": response.status_code, "body": content},
+                        details=details,
                     )
 
                 return response

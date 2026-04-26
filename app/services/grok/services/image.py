@@ -18,6 +18,7 @@ from app.core.config import get_config
 from app.core.logger import logger
 from app.core.storage import DATA_DIR
 from app.core.exceptions import AppException, ErrorType, UpstreamException
+from app.services.grok.services.model import ModelService
 from app.services.grok.utils.process import BaseProcessor
 from app.services.grok.utils.retry import pick_token, rate_limited
 from app.services.grok.utils.stream import wrap_stream_with_usage
@@ -156,7 +157,10 @@ class ImageGenerationService:
                         if rate_limited(e):
                             if yielded:
                                 raise
-                            await token_mgr.mark_rate_limited(current_token)
+                            await token_mgr.mark_rate_limited(
+                                current_token,
+                                quota_mode=ModelService.quota_mode_for_model(model_info.model_id),
+                            )
                             logger.warning(
                                 f"Token {current_token[:10]}... rate limited (429), "
                                 f"trying next token (attempt {attempt + 1}/{max_token_retries})"
@@ -206,7 +210,10 @@ class ImageGenerationService:
             except UpstreamException as e:
                 last_error = e
                 if rate_limited(e):
-                    await token_mgr.mark_rate_limited(current_token)
+                    await token_mgr.mark_rate_limited(
+                        current_token,
+                        quota_mode=ModelService.quota_mode_for_model(model_info.model_id),
+                    )
                     logger.warning(
                         f"Token {current_token[:10]}... rate limited (429), "
                         f"trying next token (attempt {attempt + 1}/{max_token_retries})"

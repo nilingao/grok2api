@@ -213,7 +213,12 @@ class TokenManager:
             if self._dirty:
                 self._schedule_save()
 
-    def get_token(self, pool_name: str = "ssoBasic", exclude: set = None) -> Optional[str]:
+    def get_token(
+        self,
+        pool_name: str = "ssoBasic",
+        exclude: set = None,
+        quota_mode: str = "auto",
+    ) -> Optional[str]:
         """
         获取可用 Token
 
@@ -229,7 +234,7 @@ class TokenManager:
             logger.warning(f"Pool '{pool_name}' not found")
             return None
 
-        token_info = pool.select(exclude=exclude)
+        token_info = pool.select(exclude=exclude, quota_mode=quota_mode)
         if not token_info:
             logger.warning(f"No available token in pool '{pool_name}'")
             return None
@@ -240,7 +245,10 @@ class TokenManager:
         return token
 
     def get_token_info(
-        self, pool_name: str = "ssoBasic", exclude: set | None = None
+        self,
+        pool_name: str = "ssoBasic",
+        exclude: set | None = None,
+        quota_mode: str = "auto",
     ) -> Optional["TokenInfo"]:
         """
         获取可用 Token 的完整信息
@@ -256,7 +264,7 @@ class TokenManager:
             logger.warning(f"Pool '{pool_name}' not found")
             return None
 
-        token_info = pool.select(exclude=exclude)
+        token_info = pool.select(exclude=exclude, quota_mode=quota_mode)
         if not token_info:
             logger.warning(f"No available token in pool '{pool_name}'")
             return None
@@ -269,6 +277,7 @@ class TokenManager:
         video_length: int = 6,
         pool_candidates: Optional[List[str]] = None,
         exclude: Optional[set[str]] = None,
+        quota_mode: str = "auto",
     ) -> Optional["TokenInfo"]:
         """
         根据视频需求智能选择 Token 池
@@ -300,7 +309,11 @@ class TokenManager:
             ordered_pools = [primary_pool, fallback_pool]
 
         for idx, pool_name in enumerate(ordered_pools):
-            token_info = self.get_token_info(pool_name, exclude=exclude)
+            token_info = self.get_token_info(
+                pool_name,
+                exclude=exclude,
+                quota_mode=quota_mode,
+            )
             if token_info:
                 if idx == 0:
                     logger.info(
@@ -552,12 +565,13 @@ class TokenManager:
         logger.warning(f"Token {raw_token[:10]}...: not found for failure record")
         return False
 
-    async def mark_rate_limited(self, token_str: str) -> bool:
+    async def mark_rate_limited(self, token_str: str, quota_mode: str = "auto") -> bool:
         """
         将 Token 标记为配额耗尽（COOLING）
 
-        当 Grok API 返回 429 时调用，将 quota 设为 0 并标记 COOLING，
-        使该 Token 不再被选中，等待下次 Scheduler 刷新恢复。
+        当 Grok API 返回 429 且确认为对应模型额度耗尽时调用。
+        - auto 窗口耗尽：置 0 并标记 COOLING
+        - fast/expert/heavy/grok_4_3 窗口耗尽：仅置对应窗口为 0，保留账号整体 ACTIVE 状态
 
         Args:
             token_str: Token 字符串
@@ -570,12 +584,15 @@ class TokenManager:
         for pool in self.pools.values():
             token = pool.get(raw_token)
             if token:
-                old_quota = token.primary_quota()
-                token.update_quota(0)
-                token.status = TokenStatus.COOLING
+                old_quota = token.mode_quota(quota_mode)
+                token.update_quota(0, mode=quota_mode)
+                if quota_mode == "auto":
+                    token.status = TokenStatus.COOLING
+                elif token.primary_quota() > 0 and token.status != TokenStatus.DISABLED:
+                    token.status = TokenStatus.ACTIVE
                 logger.warning(
                     f"Token {raw_token[:10]}...: marked as rate limited "
-                    f"(quota {old_quota} -> 0, status -> cooling)"
+                    f"(mode={quota_mode}, quota {old_quota} -> 0, status -> {token.status})"
                 )
                 self._schedule_save()
                 return True
@@ -873,6 +890,123 @@ class TokenManager:
             f"recovered={recovered}, expired={expired}"
         )
 
+        return {
+            "checked": len(to_refresh),
+            "refreshed": refreshed,
+            "recovered": recovered,
+            "expired": expired,
+        }
+
+    async def refresh_unavailable_tokens(
+        self,
+        pool_names: Optional[List[str]] = None,
+    ) -> Dict[str, int]:
+        """
+        当没有可用 Token 时，强制刷新一次异常 Token。
+
+        刷新范围：
+        - COOLING：配额耗尽，可能已恢复
+        - EXPIRED：历史异常账号，允许人工开启此开关时再次探测
+
+        不刷新 DISABLED，避免覆盖手动禁用语义。
+        """
+        target_pools = set(pool_names or [])
+        to_refresh: List[TokenInfo] = []
+        for pool_name, pool in self.pools.items():
+            if target_pools and pool_name not in target_pools:
+                continue
+            for token in pool:
+                if token.status in {TokenStatus.COOLING, TokenStatus.EXPIRED}:
+                    to_refresh.append(token)
+
+        if not to_refresh:
+            logger.info(
+                "Refresh unavailable check: no abnormal tokens to refresh"
+                + (f" in pools={sorted(target_pools)}" if target_pools else "")
+            )
+            return {"checked": 0, "refreshed": 0, "recovered": 0, "expired": 0}
+
+        logger.info(
+            "Refresh unavailable check: forcing refresh for "
+            f"{len(to_refresh)} abnormal tokens"
+            + (f" in pools={sorted(target_pools)}" if target_pools else "")
+        )
+
+        semaphore = asyncio.Semaphore(DEFAULT_REFRESH_CONCURRENCY)
+        usage_service = UsageService()
+        refreshed = 0
+        recovered = 0
+        expired = 0
+
+        async def _refresh_one(token_info: TokenInfo) -> dict:
+            async with semaphore:
+                token_str = token_info.token
+                if token_str.startswith("sso="):
+                    token_str = token_str[4:]
+
+                for retry in range(3):
+                    try:
+                        old_quota = token_info.primary_quota()
+                        old_status = token_info.status
+                        synced = await self.sync_usage_windows(token_str, is_usage=False)
+                        if not synced:
+                            result = await usage_service.get(token_str)
+                            new_quota = None
+                            if result:
+                                new_quota = result.get("remainingTokens")
+                                if new_quota is None:
+                                    new_quota = result.get("remainingQueries")
+                            if new_quota is None:
+                                return {"recovered": False, "expired": False}
+                            token_info.update_quota(new_quota)
+                            token_info.mark_synced()
+                        new_quota = token_info.primary_quota()
+                        logger.info(
+                            f"Token {token_info.token[:10]}...: force refreshed "
+                            f"{old_quota} -> {new_quota}, status: {old_status} -> {token_info.status}"
+                        )
+                        return {
+                            "recovered": new_quota > 0 and old_status != TokenStatus.ACTIVE,
+                            "expired": False,
+                        }
+                    except Exception as e:
+                        error_str = str(e)
+                        if "401" in error_str or "Unauthorized" in error_str:
+                            if retry < 2:
+                                logger.warning(
+                                    f"Token {token_info.token[:10]}...: 401 error during force refresh, "
+                                    f"retry {retry + 1}/2..."
+                                )
+                                await asyncio.sleep(0.5)
+                                continue
+                            logger.error(
+                                f"Token {token_info.token[:10]}...: 401 after 2 retries during force refresh, "
+                                "marking as expired"
+                            )
+                            token_info.status = TokenStatus.EXPIRED
+                            return {"recovered": False, "expired": True}
+                        logger.warning(
+                            f"Token {token_info.token[:10]}...: force refresh failed ({e})"
+                        )
+                        return {"recovered": False, "expired": False}
+
+                return {"recovered": False, "expired": False}
+
+        for i in range(0, len(to_refresh), DEFAULT_REFRESH_BATCH_SIZE):
+            batch = to_refresh[i : i + DEFAULT_REFRESH_BATCH_SIZE]
+            results = await asyncio.gather(*[_refresh_one(t) for t in batch])
+            refreshed += len(batch)
+            recovered += sum(r["recovered"] for r in results)
+            expired += sum(r["expired"] for r in results)
+            if i + DEFAULT_REFRESH_BATCH_SIZE < len(to_refresh):
+                await asyncio.sleep(1)
+
+        await self._save()
+
+        logger.info(
+            f"Refresh unavailable completed: checked={len(to_refresh)}, "
+            f"refreshed={refreshed}, recovered={recovered}, expired={expired}"
+        )
         return {
             "checked": len(to_refresh),
             "refreshed": refreshed,

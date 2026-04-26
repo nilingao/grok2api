@@ -86,6 +86,8 @@ fail_threshold = 5
 save_delay_ms = 500
 # 多 worker 状态同步间隔（秒）
 reload_interval_sec = 30
+# 当没有可用 Token 时，是否强制刷新一次异常 Token 并重试一次
+refresh_unavailable_once = false
 
 # ==================== 模型路由配置 ====================
 [model_routing]

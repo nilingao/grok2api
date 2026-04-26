@@ -31,6 +31,7 @@ from app.services.grok.utils.process import (
 from app.services.grok.utils.upload import UploadService
 from app.services.grok.utils.retry import pick_token, rate_limited
 from app.services.grok.services.chat import GrokChatService
+from app.services.grok.services.model import ModelService
 from app.services.grok.services.video import VideoService
 from app.services.grok.utils.stream import wrap_stream_with_usage
 from app.services.reverse.media_post import MediaPostReverse
@@ -496,7 +497,10 @@ class ImageEditService:
             except UpstreamException as e:
                 last_error = e
                 if rate_limited(e):
-                    await token_mgr.mark_rate_limited(current_token)
+                    await token_mgr.mark_rate_limited(
+                        current_token,
+                        quota_mode=ModelService.quota_mode_for_model(model_info.model_id),
+                    )
                     await self._emit_progress(
                         progress_cb,
                         "rate_limited",
@@ -710,7 +714,10 @@ class ImageEditService:
             except UpstreamException as e:
                 last_error = e
                 if rate_limited(e):
-                    await token_mgr.mark_rate_limited(current_token)
+                    await token_mgr.mark_rate_limited(
+                        current_token,
+                        quota_mode=ModelService.quota_mode_for_model(model_info.model_id),
+                    )
                     await self._emit_progress(
                         progress_cb,
                         "rate_limited",

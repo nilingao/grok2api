@@ -49,8 +49,9 @@ def _build_imagine_public_url(parent_post_id: str) -> str:
 
 async def _pick_imagine_parent_token(token_mgr, model_id: str, parent_post_id: str) -> str | None:
     """图片 parentPostId 编辑统一使用当前请求可用 token。"""
+    quota_mode = ModelService.quota_mode_for_model(model_id)
     for pool_name in ModelService.pool_candidates_for_model(model_id):
-        token = token_mgr.get_token(pool_name)
+        token = token_mgr.get_token(pool_name, quota_mode=quota_mode)
         if token:
             logger.info(
                 "Imagine edit selected pool token: "
@@ -557,10 +558,11 @@ async def public_imagine_ws(websocket: WebSocket):
             try:
                 await token_mgr.reload_if_stale()
                 token = None
+                quota_mode = ModelService.quota_mode_for_model(model_info.model_id)
                 for pool_name in ModelService.pool_candidates_for_model(
                     model_info.model_id
                 ):
-                    token = token_mgr.get_token(pool_name)
+                    token = token_mgr.get_token(pool_name, quota_mode=quota_mode)
                     if token:
                         break
 
@@ -777,10 +779,11 @@ async def public_imagine_sse(
                 try:
                     await token_mgr.reload_if_stale()
                     token = None
+                    quota_mode = ModelService.quota_mode_for_model(model_info.model_id)
                     for pool_name in ModelService.pool_candidates_for_model(
                         model_info.model_id
                     ):
-                        token = token_mgr.get_token(pool_name)
+                        token = token_mgr.get_token(pool_name, quota_mode=quota_mode)
                         if token:
                             break
 
@@ -1150,8 +1153,9 @@ async def public_imagine_workbench_edit(data: ImagineWorkbenchEditRequest, reque
         token = await _pick_imagine_parent_token(token_mgr, model_id, parent_post_id)
 
     if not token:
+        quota_mode = ModelService.quota_mode_for_model(model_id)
         for pool_name in ModelService.pool_candidates_for_model(model_id):
-            token = token_mgr.get_token(pool_name)
+            token = token_mgr.get_token(pool_name, quota_mode=quota_mode)
             if token:
                 break
     if not token:

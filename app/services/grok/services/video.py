@@ -1253,6 +1253,7 @@ class VideoService:
                 video_length=video_length,
                 pool_candidates=pool_candidates,
                 exclude=used_tokens,
+                quota_mode=ModelService.quota_mode_for_model(model),
             )
 
             if not token_info:
@@ -1443,7 +1444,10 @@ class VideoService:
                 status_code = e.details.get("status") if e.details else getattr(e, "status_code", None)
                 if rate_limited(e) or status_code == 401:
                     if rate_limited(e):
-                        await token_mgr.mark_rate_limited(token)
+                        await token_mgr.mark_rate_limited(
+                            token,
+                            quota_mode=ModelService.quota_mode_for_model(model),
+                        )
                     else:
                         await token_mgr.record_fail(token, status_code, "video_auth_failed_401")
                     logger.warning(

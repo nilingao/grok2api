@@ -173,12 +173,19 @@ class TokenInfo(BaseModel):
     def primary_quota(self) -> int:
         return self.quota_set().primary_remaining()
 
+    def mode_quota(self, mode: str = "auto") -> int:
+        return self.quota_set().mode_remaining(mode)
+
     def total_quota(self) -> int:
         return self.quota_set().total_remaining()
 
     def is_available(self) -> bool:
         """检查是否可用（状态正常且配额 > 0）"""
         return self.status == TokenStatus.ACTIVE and self.primary_quota() > 0
+
+    def is_mode_available(self, mode: str = "auto") -> bool:
+        """检查指定额度窗口是否可用。"""
+        return self.status == TokenStatus.ACTIVE and self.mode_quota(mode) > 0
 
     def consume(self, effort: EffortType = EffortType.LOW) -> int:
         """

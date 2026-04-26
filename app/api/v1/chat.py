@@ -835,10 +835,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         token_mgr = await get_token_manager()
         await token_mgr.reload_if_stale()
+        quota_mode = ModelService.quota_mode_for_model(request.model)
 
         token = None
         for pool_name in ModelService.pool_candidates_for_model(request.model):
-            token = token_mgr.get_token(pool_name)
+            token = token_mgr.get_token(pool_name, quota_mode=quota_mode)
             if token:
                 break
 
@@ -904,10 +905,11 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
 
         token_mgr = await get_token_manager()
         await token_mgr.reload_if_stale()
+        quota_mode = ModelService.quota_mode_for_model(request.model)
 
         token = None
         for pool_name in ModelService.pool_candidates_for_model(request.model):
-            token = token_mgr.get_token(pool_name)
+            token = token_mgr.get_token(pool_name, quota_mode=quota_mode)
             if token:
                 break
 
