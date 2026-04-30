@@ -38,6 +38,42 @@ from app.services.grok.utils.tool_call import (
 _CHAT_SEMAPHORE = None
 _CHAT_SEM_VALUE = None
 
+_QUOTA_MODE_LABELS = {
+    "auto": "Auto",
+    "fast": "Fast",
+    "expert": "Expert",
+    "heavy": "Heavy",
+    "grok_4_3": "4.3 Beta",
+}
+
+
+def _describe_upstream_chat_error(exc: Exception) -> str:
+    if not isinstance(exc, UpstreamException):
+        return "请求失败，请重试。"
+    details = exc.details if isinstance(exc.details, dict) else {}
+    status = details.get("status")
+    if status == 429:
+        quota_mode = str(details.get("quota_mode") or "").strip()
+        error_code = str(details.get("error_code") or "").strip()
+        wait_seconds = details.get("quota_wait_seconds")
+        if error_code == "quota_exhausted" and quota_mode:
+            label = _QUOTA_MODE_LABELS.get(quota_mode, quota_mode)
+            if isinstance(wait_seconds, (int, float)) and wait_seconds > 0:
+                wait_seconds = int(wait_seconds)
+                hours = wait_seconds // 3600
+                minutes = (wait_seconds % 3600) // 60
+                if hours > 0:
+                    return f"{label} 模型额度已用完，请约 {hours} 小时 {minutes} 分钟后重试。"
+                if minutes > 0:
+                    return f"{label} 模型额度已用完，请约 {minutes} 分钟后重试。"
+            return f"{label} 模型额度已用完，请稍后重试。"
+        return "请求过于频繁或上游暂时限流，请稍后重试。"
+    if status == 401:
+        return "上游认证失败，请检查账号状态。"
+    if status == 403:
+        return "上游拒绝了本次请求，请稍后重试。"
+    return "请求失败，请重试。"
+
 
 def extract_tool_text(raw: str, rollout_id: str = "") -> str:
     if not raw:
@@ -802,10 +838,17 @@ class ChatService:
                 last_error = e
 
                 if rate_limited(e):
-                    # 配额不足，标记 token 为 cooling 并换 token 重试
-                    await token_mgr.mark_rate_limited(token)
+                    # 仅在确认对应模型额度耗尽时，才归零该额度窗口。
+                    error_code = str((e.details or {}).get("error_code") or "").strip()
+                    quota_mode = str((e.details or {}).get("quota_mode") or "").strip()
+                    if error_code == "quota_exhausted":
+                        await token_mgr.mark_rate_limited(
+                            token,
+                            quota_mode=quota_mode or ModelService.quota_mode_for_model(model),
+                        )
                     logger.warning(
-                        f"Token {token[:10]}... rate limited (429), "
+                        f"Token {token[:10]}... rate limited (429"
+                        f"{', quota_exhausted' if error_code == 'quota_exhausted' else ''}), "
                         f"trying next token (attempt {attempt + 1}/{max_token_retries})"
                     )
                     continue
@@ -1324,7 +1367,19 @@ class StreamProcessor(proc_base.BaseProcessor):
             if not self.role_sent:
                 yield self._sse(role="assistant")
                 self.role_sent = True
-            yield self._sse("请求上游失败，请稍后重试。")
+                yield self._sse("请求上游失败，请稍后重试。")
+                yield self._sse(finish="stop")
+                yield "data: [DONE]\n\n"
+                return
+        except UpstreamException as e:
+            logger.error(
+                f"Stream upstream error: {e}",
+                extra={"model": self.model, "error_type": type(e).__name__},
+            )
+            if not self.role_sent:
+                yield self._sse(role="assistant")
+                self.role_sent = True
+            yield self._sse(_describe_upstream_chat_error(e))
             yield self._sse(finish="stop")
             yield "data: [DONE]\n\n"
             return
@@ -1497,6 +1552,12 @@ class CollectProcessor(proc_base.BaseProcessor):
                 )
             else:
                 logger.error(f"Collect request error: {e}", extra={"model": self.model})
+        except UpstreamException as e:
+            logger.error(
+                f"Collect upstream error: {e}",
+                extra={"model": self.model, "error_type": type(e).__name__},
+            )
+            content = _describe_upstream_chat_error(e)
         except Exception as e:
             logger.error(
                 f"Collect processing error: {e}",
